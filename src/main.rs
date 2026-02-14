@@ -174,7 +174,7 @@ fn build_ui(app: &Application) {
     root.append(&status_label);
 
     // ── Start button ──────────────────────────────────────────────────
-    let btn_start = Button::with_label("Start");
+    let btn_start = Button::with_label("Transfer");
     btn_start.add_css_class("suggested-action");
     root.append(&btn_start);
 
@@ -794,15 +794,51 @@ fn run_worker(
             }
         }
 
-        // Skip if file exists and overwrite is off
-        if !overwrite && dest_file.exists() {
-            skipped.push(format!("{}: already exists at destination", file_path.display()));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total,
-                file: file_path.to_string_lossy().to_string(),
-            });
-            continue;
+        // Check if destination already exists
+        if dest_file.exists() {
+            match files_are_identical(file_path, &dest_file) {
+                Ok(true) => {
+                    // Destination is already identical — no copy needed
+                    if do_move {
+                        // Just delete the source
+                        if let Err(e) = fs::remove_file(file_path) {
+                            errors.push(format!("{}: identical at destination but failed to delete source: {}", file_path.display(), e));
+                        } else {
+                            copied += 1;
+                        }
+                    } else {
+                        skipped.push(format!("{}: identical at destination", file_path.display()));
+                    }
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total,
+                        file: file_path.to_string_lossy().to_string(),
+                    });
+                    continue;
+                }
+                Ok(false) => {
+                    // File differs — skip if overwrite is off
+                    if !overwrite {
+                        skipped.push(format!("{}: different version exists at destination", file_path.display()));
+                        let _ = tx.send(WorkerMsg::Progress {
+                            done: i + 1,
+                            total,
+                            file: file_path.to_string_lossy().to_string(),
+                        });
+                        continue;
+                    }
+                    // Otherwise fall through to overwrite
+                }
+                Err(e) => {
+                    errors.push(format!("{}: could not compare with destination: {}", file_path.display(), e));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total,
+                        file: file_path.to_string_lossy().to_string(),
+                    });
+                    continue;
+                }
+            }
         }
 
         let result = if do_move {
