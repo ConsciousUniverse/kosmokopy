@@ -1,16 +1,19 @@
 use std::cell::RefCell;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::collections::HashSet;
+
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, AlertDialog, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton,
-    FileDialog, Label, Orientation, ProgressBar, ScrolledWindow, Separator, TextView, WrapMode,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry,
+    FileDialog, Label, Orientation, ProgressBar, ScrolledWindow, Separator, TextView, Window,
+    WrapMode,
 };
 use walkdir::WalkDir;
 
@@ -49,7 +52,8 @@ enum WorkerMsg {
     },
     Finished {
         copied: usize,
-        skipped: usize,
+        skipped: Vec<String>,
+        excluded: usize,
         errors: Vec<String>,
     },
     Error(String),
@@ -94,8 +98,8 @@ fn build_ui(app: &Application) {
     root.append(&src_row);
 
     // ── Destination directory ─────────────────────────────────────────
-    let dst_row = dir_row("Destination Directory:");
-    let dst_label: Label = dst_row.2.clone();
+    let dst_row = dir_row_editable("Destination Directory:");
+    let dst_entry: Entry = dst_row.2.clone();
     root.append(&dst_row.0);
 
     // ── Copy / Move toggle ────────────────────────────────────────────
@@ -120,15 +124,25 @@ fn build_ui(app: &Application) {
 
     root.append(&Separator::new(Orientation::Horizontal));
 
-    // ── Exclude patterns ──────────────────────────────────────────────
-    let excl_label = Label::new(Some("Exclude directory patterns (one per line):"));
-    excl_label.set_halign(Align::Start);
-    root.append(&excl_label);
+    // ── Exclusions ────────────────────────────────────────────────────
+    let excl_heading = Label::new(Some("Exclusions:"));
+    excl_heading.set_halign(Align::Start);
+    root.append(&excl_heading);
+
+    let excl_btn_row = GtkBox::new(Orientation::Horizontal, 8);
+    let btn_excl_dirs = Button::with_label("Exclude Directories…");
+    let btn_excl_files = Button::with_label("Exclude Files…");
+    let btn_excl_clear = Button::with_label("Clear");
+    excl_btn_row.append(&btn_excl_dirs);
+    excl_btn_row.append(&btn_excl_files);
+    excl_btn_row.append(&btn_excl_clear);
+    root.append(&excl_btn_row);
 
     let excl_view = TextView::new();
+    excl_view.set_editable(false);
+    excl_view.set_cursor_visible(false);
     excl_view.set_wrap_mode(WrapMode::WordChar);
     excl_view.set_monospace(true);
-    excl_view.buffer().set_text(".*");
 
     let excl_scroll = ScrolledWindow::builder()
         .child(&excl_view)
@@ -136,6 +150,14 @@ fn build_ui(app: &Application) {
         .vexpand(true)
         .build();
     root.append(&excl_scroll);
+
+    // Shared exclusion state: dirs stored as "/dirname", files as "filename"
+    let exclusions: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // ── Overwrite toggle ─────────────────────────────────────────────
+    let chk_overwrite = CheckButton::with_label("Overwrite existing files");
+    chk_overwrite.set_active(false);
+    root.append(&chk_overwrite);
 
     root.append(&Separator::new(Orientation::Horizontal));
 
@@ -232,9 +254,102 @@ fn build_ui(app: &Application) {
     // ── Destination browse ────────────────────────────────────────────
     {
         let win_clone = window.clone();
-        let dst_label_c = dst_label.clone();
+        let dst_entry_c = dst_entry.clone();
         dst_row.1.connect_clicked(move |_| {
-            pick_folder(&win_clone, dst_label_c.clone());
+            pick_folder(&win_clone, dst_entry_c.clone());
+        });
+    }
+
+    // ── Exclusion buttons ─────────────────────────────────────────────
+    {
+        let win = window.clone();
+        let source_sel = source_selection.clone();
+        let excls = exclusions.clone();
+        let view = excl_view.clone();
+        btn_excl_dirs.connect_clicked(move |_| {
+            let src = source_sel.borrow().clone();
+            let initial = match &src {
+                SourceSelection::Directory(p) => Some(p.clone()),
+                _ => None,
+            };
+            let dialog = FileDialog::builder()
+                .title("Select directory to exclude")
+                .modal(true)
+                .build();
+            if let Some(ref dir) = initial {
+                dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(dir)));
+            }
+            let excls2 = excls.clone();
+            let view2 = view.clone();
+            dialog.select_folder(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        let dir_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        let entry = format!("/{}", dir_name);
+                        let mut list = excls2.borrow_mut();
+                        if !list.contains(&entry) {
+                            list.push(entry);
+                        }
+                        refresh_exclusion_view(&view2, &list);
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let win = window.clone();
+        let source_sel = source_selection.clone();
+        let excls = exclusions.clone();
+        let view = excl_view.clone();
+        btn_excl_files.connect_clicked(move |_| {
+            let src = source_sel.borrow().clone();
+            let initial = match &src {
+                SourceSelection::Directory(p) => Some(p.clone()),
+                _ => None,
+            };
+            let dialog = FileDialog::builder()
+                .title("Select files to exclude")
+                .modal(true)
+                .build();
+            if let Some(ref dir) = initial {
+                dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(dir)));
+            }
+            let excls2 = excls.clone();
+            let view2 = view.clone();
+            dialog.open_multiple(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+                if let Ok(files) = result {
+                    let mut list = excls2.borrow_mut();
+                    for i in 0..files.n_items() {
+                        if let Some(obj) = files.item(i) {
+                            if let Ok(gfile) = obj.downcast::<gtk4::gio::File>() {
+                                if let Some(p) = gfile.path() {
+                                    let fname = p
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    if !list.contains(&fname) {
+                                        list.push(fname);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    refresh_exclusion_view(&view2, &list);
+                }
+            });
+        });
+    }
+
+    {
+        let excls = exclusions.clone();
+        let view = excl_view.clone();
+        btn_excl_clear.connect_clicked(move |_| {
+            excls.borrow_mut().clear();
+            view.buffer().set_text("");
         });
     }
 
@@ -243,10 +358,11 @@ fn build_ui(app: &Application) {
 
     btn_start.connect_clicked({
         let source_selection = source_selection.clone();
-        let dst_label = dst_label.clone();
+        let dst_entry = dst_entry.clone();
         let chk_move = chk_move.clone();
         let chk_folders_files = chk_folders_files.clone();
-        let excl_view = excl_view.clone();
+        let chk_overwrite = chk_overwrite.clone();
+        let exclusions = exclusions.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
         let btn_start = btn_start.clone();
@@ -259,7 +375,7 @@ fn build_ui(app: &Application) {
             }
 
             let source_sel = source_selection.borrow().clone();
-            let dst = dst_label.text().to_string();
+            let dst = dst_entry.text().to_string();
 
             match &source_sel {
                 SourceSelection::None => {
@@ -273,27 +389,20 @@ fn build_ui(app: &Application) {
                 _ => {}
             }
 
-            if dst.is_empty() || dst == "(none)" {
-                status_label.set_text("Please select a destination directory.");
+            if dst.is_empty() {
+                status_label.set_text("Please select or type a destination directory.");
                 return;
             }
 
             let do_move = chk_move.is_active();
+            let overwrite = chk_overwrite.is_active();
             let transfer_mode = if chk_folders_files.is_active() {
                 TransferMode::FoldersAndFiles
             } else {
                 TransferMode::FilesOnly
             };
 
-            let buf = excl_view.buffer();
-            let text = buf
-                .text(&buf.start_iter(), &buf.end_iter(), false)
-                .to_string();
-            let patterns: Vec<String> = text
-                .lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect();
+            let patterns: Vec<String> = exclusions.borrow().clone();
 
             *running.borrow_mut() = true;
             btn_start.set_sensitive(false);
@@ -307,7 +416,7 @@ fn build_ui(app: &Application) {
             // Spawn worker thread
             let dst_clone = dst.clone();
             thread::spawn(move || {
-                run_worker(source_sel, dst_clone, do_move, transfer_mode, &patterns, tx);
+                run_worker(source_sel, dst_clone, do_move, overwrite, transfer_mode, &patterns, tx);
             });
 
             // Poll for messages on the glib main loop
@@ -337,37 +446,39 @@ fn build_ui(app: &Application) {
                         WorkerMsg::Finished {
                             copied,
                             skipped,
+                            excluded,
                             errors,
                         } => {
                             progress_bar_c.set_fraction(1.0);
                             let verb = if do_move { "Moved" } else { "Copied" };
-                            let mut summary =
-                                format!("{} {} file(s), {} skipped.", verb, copied, skipped);
-                            if !errors.is_empty() {
-                                summary.push_str(&format!(
-                                    "\n\n{} error(s).\nFirst: {}",
-                                    errors.len(),
-                                    errors[0]
-                                ));
-                            }
+                            let summary = format!(
+                                "{} {} file(s), {} skipped, {} excluded.",
+                                verb, copied, skipped.len(), excluded
+                            );
                             progress_bar_c.set_text(Some("Complete"));
                             status_label_c.set_text(&summary);
                             btn_start_c.set_sensitive(true);
                             *running_c.borrow_mut() = false;
 
-                            // Show prominent completion dialog
-                            let title = if errors.is_empty() {
+                            let title = if errors.is_empty() && skipped.is_empty() {
                                 "Complete"
-                            } else {
+                            } else if !errors.is_empty() {
                                 "Completed with errors"
+                            } else {
+                                "Completed with skipped files"
                             };
-                            let dialog = AlertDialog::builder()
-                                .modal(true)
-                                .message(title)
-                                .detail(&summary)
-                                .build();
-                            dialog.set_buttons(&["OK"]);
-                            dialog.show(Some(&window_c));
+
+                            // Combine skipped and errors for the dialog
+                            let mut all_notes = Vec::new();
+                            if !skipped.is_empty() {
+                                all_notes.push(format!("Skipped ({}):", skipped.len()));
+                                all_notes.extend(skipped);
+                            }
+                            if !errors.is_empty() {
+                                all_notes.push(format!("Errors ({}):", errors.len()));
+                                all_notes.extend(errors);
+                            }
+                            show_result_dialog(&window_c, title, &summary, &all_notes);
 
                             return glib::ControlFlow::Break;
                         }
@@ -378,13 +489,7 @@ fn build_ui(app: &Application) {
                             btn_start_c.set_sensitive(true);
                             *running_c.borrow_mut() = false;
 
-                            let dialog = AlertDialog::builder()
-                                .modal(true)
-                                .message("Error")
-                                .detail(&e)
-                                .build();
-                            dialog.set_buttons(&["OK"]);
-                            dialog.show(Some(&window_c));
+                            show_result_dialog(&window_c, "Error", &e, &[]);
 
                             return glib::ControlFlow::Break;
                         }
@@ -398,31 +503,98 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
-// ── Helper: directory chooser row ──────────────────────────────────────
+// ── Helper: directory chooser row (editable) ──────────────────────────
 
-fn dir_row(label_text: &str) -> (GtkBox, Button, Label) {
+fn dir_row_editable(label_text: &str) -> (GtkBox, Button, Entry) {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let label = Label::new(Some(label_text));
     label.set_width_chars(20);
     label.set_halign(Align::Start);
 
-    let path_label = Label::new(Some("(none)"));
-    path_label.set_hexpand(true);
-    path_label.set_halign(Align::Start);
-    path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
+    let entry = Entry::new();
+    entry.set_hexpand(true);
+    entry.set_placeholder_text(Some("Type a path or browse…"));
 
     let btn = Button::with_label("Browse…");
 
     row.append(&label);
-    row.append(&path_label);
+    row.append(&entry);
     row.append(&btn);
 
-    (row, btn, path_label)
+    (row, btn, entry)
+}
+
+// ── Helper: result dialog with scrollable error list ───────────────────
+
+fn show_result_dialog(parent: &ApplicationWindow, title: &str, summary: &str, errors: &[String]) {
+    let dialog = Window::builder()
+        .title(title)
+        .modal(true)
+        .transient_for(parent)
+        .default_width(500)
+        .default_height(if errors.is_empty() { 150 } else { 400 })
+        .resizable(true)
+        .build();
+
+    let vbox = GtkBox::new(Orientation::Vertical, 12);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    vbox.set_margin_start(16);
+    vbox.set_margin_end(16);
+
+    // Summary label (large & bold)
+    let summary_label = Label::new(None);
+    summary_label.set_halign(Align::Start);
+    summary_label.set_wrap(true);
+    summary_label.set_markup(&format!("<big><b>{}</b></big>", glib::markup_escape_text(summary)));
+    vbox.append(&summary_label);
+
+    // Scrollable error list
+    if !errors.is_empty() {
+        let error_heading = Label::new(None);
+        error_heading.set_halign(Align::Start);
+        error_heading.set_markup(&format!("<b>{} error(s):</b>", errors.len()));
+        vbox.append(&error_heading);
+
+        let error_text = errors
+            .iter()
+            .enumerate()
+            .map(|(i, e)| format!("{}. {}", i + 1, e))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let error_view = TextView::new();
+        error_view.set_editable(false);
+        error_view.set_cursor_visible(false);
+        error_view.set_wrap_mode(WrapMode::WordChar);
+        error_view.set_monospace(true);
+        error_view.buffer().set_text(&error_text);
+
+        let scroll = ScrolledWindow::builder()
+            .child(&error_view)
+            .min_content_height(150)
+            .vexpand(true)
+            .build();
+        vbox.append(&scroll);
+    }
+
+    // OK button
+    let btn_ok = Button::with_label("OK");
+    btn_ok.add_css_class("suggested-action");
+    btn_ok.set_halign(Align::End);
+    let dialog_ref = dialog.clone();
+    btn_ok.connect_clicked(move |_| {
+        dialog_ref.close();
+    });
+    vbox.append(&btn_ok);
+
+    dialog.set_child(Some(&vbox));
+    dialog.present();
 }
 
 // ── Helper: open folder picker ─────────────────────────────────────────
 
-fn pick_folder(window: &ApplicationWindow, target_label: Label) {
+fn pick_folder(window: &ApplicationWindow, target_entry: Entry) {
     let dialog = FileDialog::builder()
         .title("Select folder")
         .modal(true)
@@ -431,10 +603,26 @@ fn pick_folder(window: &ApplicationWindow, target_label: Label) {
     dialog.select_folder(Some(window), gtk4::gio::Cancellable::NONE, move |result| {
         if let Ok(file) = result {
             if let Some(path) = file.path() {
-                target_label.set_text(&path.to_string_lossy());
+                target_entry.set_text(&path.to_string_lossy());
             }
         }
     });
+}
+
+// ── Helper: refresh the exclusion display ──────────────────────────────
+
+fn refresh_exclusion_view(view: &TextView, items: &[String]) {
+    let display: Vec<String> = items
+        .iter()
+        .map(|item| {
+            if item.starts_with('/') {
+                format!("{}/ (recursive)", item)
+            } else {
+                item.clone()
+            }
+        })
+        .collect();
+    view.buffer().set_text(&display.join("\n"));
 }
 
 // ── Worker thread ──────────────────────────────────────────────────────
@@ -443,49 +631,69 @@ fn run_worker(
     source: SourceSelection,
     dst: String,
     do_move: bool,
+    overwrite: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let dst_path = PathBuf::from(&dst);
 
+    // Create destination directory if it doesn't exist
+    if !dst_path.exists() {
+        if let Err(e) = fs::create_dir_all(&dst_path) {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create destination directory: {}",
+                e
+            )));
+            return;
+        }
+    }
+
     // Collect the files to process
-    let files: Vec<PathBuf> = match &source {
+    let (files, excluded): (Vec<PathBuf>, usize) = match &source {
         SourceSelection::None => {
             let _ = tx.send(WorkerMsg::Error("No source selected.".to_string()));
             return;
         }
-        SourceSelection::Files(paths) => paths.clone(),
+        SourceSelection::Files(paths) => (paths.clone(), 0),
         SourceSelection::Directory(src_dir) => {
-            let glob_set = match build_glob_set(patterns) {
-                Ok(gs) => gs,
-                Err(e) => {
-                    let _ =
-                        tx.send(WorkerMsg::Error(format!("Invalid exclude pattern: {}", e)));
-                    return;
-                }
-            };
+            let excluded_dirs: HashSet<String> = patterns
+                .iter()
+                .filter(|p| p.starts_with('/'))
+                .map(|p| p.trim_start_matches('/').to_string())
+                .collect();
+            let excluded_files: HashSet<String> = patterns
+                .iter()
+                .filter(|p| !p.starts_with('/'))
+                .cloned()
+                .collect();
 
             let src_dir = src_dir.clone();
             let mut collected = Vec::new();
+            let mut excluded_count = 0usize;
             for entry in WalkDir::new(&src_dir).into_iter().filter_entry(|e| {
                 if e.path() == src_dir.as_path() {
                     return true;
                 }
                 if e.file_type().is_dir() {
-                    let name = e.file_name().to_string_lossy();
-                    return !glob_set.is_match(name.as_ref());
+                    let name = e.file_name().to_string_lossy().to_string();
+                    return !excluded_dirs.contains(&name);
                 }
                 true
             }) {
                 match entry {
                     Ok(e) if e.file_type().is_file() => {
-                        collected.push(e.into_path());
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if excluded_files.contains(&name) {
+                            excluded_count += 1;
+                        } else {
+                            collected.push(e.into_path());
+                        }
                     }
                     _ => {}
                 }
             }
-            collected
+            (collected, excluded_count)
         }
     };
 
@@ -493,7 +701,8 @@ fn run_worker(
     if total == 0 {
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
-            skipped: 0,
+            skipped: vec![],
+            excluded,
             errors: vec![],
         });
         return;
@@ -506,7 +715,7 @@ fn run_worker(
     };
 
     let mut copied = 0usize;
-    let mut skipped = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for (i, file_path) in files.iter().enumerate() {
@@ -516,7 +725,7 @@ fn run_worker(
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
                 Ok(rel) => dst_path.join(rel),
                 Err(_) => {
-                    skipped += 1;
+                    skipped.push(format!("{}: outside source directory", file_path.display()));
                     continue;
                 }
             },
@@ -526,7 +735,7 @@ fn run_worker(
                 let fname = match file_path.file_name() {
                     Some(f) => f,
                     None => {
-                        skipped += 1;
+                        skipped.push(format!("{}: no filename", file_path.display()));
                         continue;
                     }
                 };
@@ -542,13 +751,61 @@ fn run_worker(
             }
         }
 
+        // Skip if file exists and overwrite is off
+        if !overwrite && dest_file.exists() {
+            skipped.push(format!("{}: already exists at destination", file_path.display()));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total,
+                file: file_path.to_string_lossy().to_string(),
+            });
+            continue;
+        }
+
         let result = if do_move {
-            // Try rename first (instant if same filesystem), fall back to copy+delete
-            fs::rename(file_path, &dest_file).or_else(|_| {
-                fs::copy(file_path, &dest_file).and_then(|_| fs::remove_file(file_path))
-            })
+            // Try rename first (instant pointer change on same filesystem)
+            match fs::rename(file_path, &dest_file) {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    // Cross-device: copy + verify + delete original
+                    match fs::copy(file_path, &dest_file) {
+                        Ok(_) => match files_are_identical(file_path, &dest_file) {
+                            Ok(true) => fs::remove_file(file_path),
+                            Ok(false) => {
+                                let _ = fs::remove_file(&dest_file);
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "integrity check failed — original retained",
+                                ))
+                            }
+                            Err(e) => Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("verification error (original retained): {}", e),
+                            )),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
+            }
         } else {
-            fs::copy(file_path, &dest_file).map(|_| ())
+            // Copy + verify
+            match fs::copy(file_path, &dest_file) {
+                Ok(_) => match files_are_identical(file_path, &dest_file) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let _ = fs::remove_file(&dest_file);
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "integrity check failed — copy removed",
+                        ))
+                    }
+                    Err(e) => Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("verification error: {}", e),
+                    )),
+                },
+                Err(e) => Err(e),
+            }
         };
 
         match result {
@@ -566,16 +823,33 @@ fn run_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
+        excluded,
         errors,
     });
 }
 
-// ── Build a GlobSet from user-entered patterns ─────────────────────────
+// ── Byte-by-byte file comparison ───────────────────────────────────────
 
-fn build_glob_set(patterns: &[String]) -> Result<GlobSet, globset::Error> {
-    let mut builder = GlobSetBuilder::new();
-    for p in patterns {
-        builder.add(Glob::new(p)?);
+fn files_are_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let meta_a = fs::metadata(a)?;
+    let meta_b = fs::metadata(b)?;
+    if meta_a.len() != meta_b.len() {
+        return Ok(false);
     }
-    builder.build()
+
+    let mut fa = fs::File::open(a)?;
+    let mut fb = fs::File::open(b)?;
+    let mut buf_a = [0u8; 8192];
+    let mut buf_b = [0u8; 8192];
+
+    loop {
+        let n_a = fa.read(&mut buf_a)?;
+        let n_b = fb.read(&mut buf_b)?;
+        if n_a != n_b || buf_a[..n_a] != buf_b[..n_b] {
+            return Ok(false);
+        }
+        if n_a == 0 {
+            return Ok(true);
+        }
+    }
 }

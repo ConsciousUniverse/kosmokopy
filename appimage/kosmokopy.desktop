@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Kosmokopy
+Comment=Copy or move files with filtering and progress
+Exec=kosmokopy
+Icon=kosmokopy
+Terminal=false
+Type=Application
+Categories=Utility;FileTools;GTK;
+Keywords=copy;move;files;backup;
