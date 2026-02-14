@@ -7,3 +7,4 @@ Terminal=false
 Type=Application
 Categories=Utility;FileTools;GTK;
 Keywords=copy;move;files;backup;
+StartupWMClass=dev.kosmokopy.app

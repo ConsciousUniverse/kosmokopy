@@ -30,12 +30,28 @@ mkdir -p "${APPDIR}/usr/bin"
 mkdir -p "${APPDIR}/usr/share/applications"
 mkdir -p "${APPDIR}/usr/share/icons/hicolor/256x256/apps"
 
+# hicolor index.theme (required for GTK4 icon theme lookup)
+cat > "${APPDIR}/usr/share/icons/hicolor/index.theme" <<'THEME'
+[Icon Theme]
+Name=Hicolor
+Comment=Fallback Icon Theme
+Hidden=true
+Directories=256x256/apps
+
+[256x256/apps]
+Size=256
+Context=Applications
+Type=Threshold
+THEME
+
 # Binary
 cp "target/release/${PKG}" "${APPDIR}/usr/bin/${PKG}"
 strip "${APPDIR}/usr/bin/${PKG}" 2>/dev/null || true
 
 # Desktop file (must also be at AppDir root)
 cp appimage/kosmokopy.desktop "${APPDIR}/usr/share/applications/${PKG}.desktop"
+# Wayland/GNOME matches desktop filename to GTK app-id for the icon
+cp appimage/kosmokopy.desktop "${APPDIR}/usr/share/applications/dev.kosmokopy.app.desktop"
 cp appimage/kosmokopy.desktop "${APPDIR}/${PKG}.desktop"
 
 # Icon — use a placeholder if no icon file exists
@@ -60,6 +76,14 @@ cat > "${APPDIR}/AppRun" <<'APPRUN'
 #!/bin/bash
 HERE="$(dirname "$(readlink -f "$0")")"
 export PATH="${HERE}/usr/bin:${PATH}"
+
+# Install icon + desktop file so GNOME Shell can find them
+ICON_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+mkdir -p "${ICON_DIR}" "${DESKTOP_DIR}"
+cp -f "${HERE}/kosmokopy.png" "${ICON_DIR}/kosmokopy.png"
+cp -f "${HERE}/kosmokopy.desktop" "${DESKTOP_DIR}/dev.kosmokopy.app.desktop"
+
 exec "${HERE}/usr/bin/kosmokopy" "$@"
 APPRUN
 chmod +x "${APPDIR}/AppRun"
