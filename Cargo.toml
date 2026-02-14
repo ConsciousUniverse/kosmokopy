@@ -3,6 +3,7 @@ name = "kosmokopy"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
+authors = ["Dan Bright <dan@danbright.uk>"]
 description = "GTK4 file copier/mover — recursively copies or moves files while preserving directory structure"
 
 [dependencies]

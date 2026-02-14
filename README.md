@@ -110,7 +110,15 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 5. **Toggle overwrite** (optional) — check "Overwrite existing files" to replace differing files
 6. **Click Transfer**
 
+## Author
+
+**Dan Bright** — [dan@danbright.uk](mailto:dan@danbright.uk)
+
+This code was primarily authored using artificial intelligence (Claude Opus 4.6 model).
+
 ## License
+
+Copyright (C) 2026 Dan Bright
 
 This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
 

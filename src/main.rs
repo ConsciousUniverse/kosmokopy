@@ -1,3 +1,10 @@
+// Kosmokopy — GTK4 file copier/mover
+// Copyright (C) 2026 Dan Bright <dan@danbright.uk>
+// Licensed under the GNU General Public License v3.0
+//
+// This code was primarily authored using artificial intelligence
+// (Claude Opus 4.6 model).
+
 use std::cell::RefCell;
 use std::fs;
 use std::io::Read;
