@@ -2,7 +2,7 @@
 
 A GTK4 file copier and mover with filtering, integrity verification, and SSH remote transfer support.
 
-![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue) ![License](https://img.shields.io/badge/license-MIT-green)
+![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue) ![License](https://img.shields.io/badge/license-GPLv3-blue)
 
 ## Features
 
@@ -112,4 +112,6 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 
 ## License
 
-MIT
+This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
+
+All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt).
