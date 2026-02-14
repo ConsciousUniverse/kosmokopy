@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -416,7 +417,17 @@ fn build_ui(app: &Application) {
             // Spawn worker thread
             let dst_clone = dst.clone();
             thread::spawn(move || {
-                run_worker(source_sel, dst_clone, do_move, overwrite, transfer_mode, &patterns, tx);
+                let (remote_host, dest_path) = parse_destination(&dst_clone);
+                match remote_host {
+                    Some(host) => run_remote_worker(
+                        source_sel, &host, &dest_path, do_move, overwrite,
+                        transfer_mode, &patterns, tx,
+                    ),
+                    None => run_worker(
+                        source_sel, dest_path, do_move, overwrite,
+                        transfer_mode, &patterns, tx,
+                    ),
+                }
             });
 
             // Poll for messages on the glib main loop
@@ -513,7 +524,7 @@ fn dir_row_editable(label_text: &str) -> (GtkBox, Button, Entry) {
 
     let entry = Entry::new();
     entry.set_hexpand(true);
-    entry.set_placeholder_text(Some("Type a path or browse…"));
+    entry.set_placeholder_text(Some("Local path or host:/remote/path"));
 
     let btn = Button::with_label("Browse…");
 
@@ -625,37 +636,35 @@ fn refresh_exclusion_view(view: &TextView, items: &[String]) {
     view.buffer().set_text(&display.join("\n"));
 }
 
-// ── Worker thread ──────────────────────────────────────────────────────
+// ── Destination parsing ─────────────────────────────────────────────────
 
-fn run_worker(
-    source: SourceSelection,
-    dst: String,
-    do_move: bool,
-    overwrite: bool,
-    transfer_mode: TransferMode,
-    patterns: &[String],
-    tx: mpsc::Sender<WorkerMsg>,
-) {
-    let dst_path = PathBuf::from(&dst);
-
-    // Create destination directory if it doesn't exist
-    if !dst_path.exists() {
-        if let Err(e) = fs::create_dir_all(&dst_path) {
-            let _ = tx.send(WorkerMsg::Error(format!(
-                "Failed to create destination directory: {}",
-                e
-            )));
-            return;
+/// Parse "host:/path" → (Some(host), path).  Plain paths → (None, path).
+fn parse_destination(dst: &str) -> (Option<String>, String) {
+    if let Some(pos) = dst.find(':') {
+        let host = &dst[..pos];
+        let path = &dst[pos + 1..];
+        // Only treat as remote if host has no slashes and path is non-empty
+        if !host.is_empty() && !host.contains('/') && !path.is_empty() {
+            return (Some(host.to_string()), path.to_string());
         }
     }
+    (None, dst.to_string())
+}
 
-    // Collect the files to process
-    let (files, excluded): (Vec<PathBuf>, usize) = match &source {
-        SourceSelection::None => {
-            let _ = tx.send(WorkerMsg::Error("No source selected.".to_string()));
-            return;
-        }
-        SourceSelection::Files(paths) => (paths.clone(), 0),
+/// Shell-escape a string with single quotes (for ssh remote commands).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+// ── File collection (shared by local & remote workers) ─────────────────
+
+fn collect_files(
+    source: &SourceSelection,
+    patterns: &[String],
+) -> Result<(Vec<PathBuf>, usize), String> {
+    match source {
+        SourceSelection::None => Err("No source selected.".to_string()),
+        SourceSelection::Files(paths) => Ok((paths.clone(), 0)),
         SourceSelection::Directory(src_dir) => {
             let excluded_dirs: HashSet<String> = patterns
                 .iter()
@@ -693,7 +702,41 @@ fn run_worker(
                     _ => {}
                 }
             }
-            (collected, excluded_count)
+            Ok((collected, excluded_count))
+        }
+    }
+}
+
+// ── Worker thread (local) ──────────────────────────────────────────────
+
+fn run_worker(
+    source: SourceSelection,
+    dst: String,
+    do_move: bool,
+    overwrite: bool,
+    transfer_mode: TransferMode,
+    patterns: &[String],
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let dst_path = PathBuf::from(&dst);
+
+    // Create destination directory if it doesn't exist
+    if !dst_path.exists() {
+        if let Err(e) = fs::create_dir_all(&dst_path) {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create destination directory: {}",
+                e
+            )));
+            return;
+        }
+    }
+
+    // Collect the files to process
+    let (files, excluded) = match collect_files(&source, patterns) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            return;
         }
     };
 
@@ -817,6 +860,207 @@ fn run_worker(
             done: i + 1,
             total,
             file: file_path.to_string_lossy().to_string(),
+        });
+    }
+
+    let _ = tx.send(WorkerMsg::Finished {
+        copied,
+        skipped,
+        excluded,
+        errors,
+    });
+}
+
+// ── Worker thread (remote via ssh/scp) ─────────────────────────────────
+
+fn run_remote_worker(
+    source: SourceSelection,
+    host: &str,
+    remote_base: &str,
+    do_move: bool,
+    overwrite: bool,
+    transfer_mode: TransferMode,
+    patterns: &[String],
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    // SSH control-socket args — reuses a single TCP connection for all calls
+    let ctl = ["-o", "ControlMaster=auto",
+               "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+               "-o", "ControlPersist=60"];
+
+    // Quick connectivity check
+    let check = Command::new("ssh")
+        .args(&ctl)
+        .args([host, "echo ok"])
+        .output();
+    match check {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr);
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "SSH connection to '{}' failed: {}", host, msg.trim()
+            )));
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Could not run ssh command: {}", e
+            )));
+            return;
+        }
+    }
+
+    // Collect files locally
+    let (files, excluded) = match collect_files(&source, patterns) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            return;
+        }
+    };
+
+    let total = files.len();
+    if total == 0 {
+        let _ = tx.send(WorkerMsg::Finished {
+            copied: 0,
+            skipped: vec![],
+            excluded,
+            errors: vec![],
+        });
+        return;
+    }
+
+    let src_dir = match &source {
+        SourceSelection::Directory(d) => Some(d.clone()),
+        _ => None,
+    };
+
+    // Build list of (local_path, remote_path) pairs
+    let remote_base = remote_base.trim_end_matches('/');
+    let mut transfers: Vec<(PathBuf, String)> = Vec::new();
+    let mut remote_dirs: HashSet<String> = HashSet::new();
+    remote_dirs.insert(remote_base.to_string());
+    let mut early_skipped: Vec<String> = Vec::new();
+
+    for file_path in &files {
+        let rel_dest = match (&src_dir, transfer_mode) {
+            (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
+                Ok(rel) => rel.to_string_lossy().to_string(),
+                Err(_) => {
+                    early_skipped.push(format!(
+                        "{}: outside source directory",
+                        file_path.display()
+                    ));
+                    continue;
+                }
+            },
+            _ => match file_path.file_name() {
+                Some(f) => f.to_string_lossy().to_string(),
+                None => {
+                    early_skipped.push(format!("{}: no filename", file_path.display()));
+                    continue;
+                }
+            },
+        };
+        let remote_file = format!("{}/{}", remote_base, rel_dest);
+        if let Some(parent) = Path::new(&remote_file).parent() {
+            remote_dirs.insert(parent.to_string_lossy().to_string());
+        }
+        transfers.push((file_path.clone(), remote_file));
+    }
+
+    // Create all remote directories in one SSH call
+    let dirs_arg: Vec<String> = remote_dirs.iter().map(|d| shell_quote(d)).collect();
+    let mkdir_result = Command::new("ssh")
+        .args(&ctl)
+        .arg(host)
+        .arg(format!("mkdir -p {}", dirs_arg.join(" ")))
+        .output();
+    if let Ok(o) = &mkdir_result {
+        if !o.status.success() {
+            let msg = String::from_utf8_lossy(&o.stderr);
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create remote directories: {}", msg.trim()
+            )));
+            return;
+        }
+    }
+
+    // If !overwrite, get list of existing remote files in one SSH call
+    let existing: HashSet<String> = if !overwrite {
+        let out = Command::new("ssh")
+            .args(&ctl)
+            .arg(host)
+            .arg(format!("find {} -type f 2>/dev/null", shell_quote(remote_base)))
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let total_transfers = transfers.len();
+    let mut copied = 0usize;
+    let mut skipped = early_skipped;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, (local, remote)) in transfers.iter().enumerate() {
+        // Skip if file exists remotely and overwrite is off
+        if !overwrite && existing.contains(remote) {
+            skipped.push(format!(
+                "{}: already exists at destination",
+                local.display()
+            ));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: local.to_string_lossy().to_string(),
+            });
+            continue;
+        }
+
+        // Transfer via scp
+        let scp_result = Command::new("scp")
+            .args(&ctl)
+            .arg("-q")
+            .arg(local)
+            .arg(format!("{}:{}", host, remote))
+            .status();
+
+        match scp_result {
+            Ok(s) if s.success() => {
+                copied += 1;
+                if do_move {
+                    if let Err(e) = fs::remove_file(local) {
+                        errors.push(format!(
+                            "{}: transferred but failed to delete local: {}",
+                            local.display(),
+                            e
+                        ));
+                    }
+                }
+            }
+            Ok(s) => {
+                errors.push(format!(
+                    "{}: scp failed (exit code {})",
+                    local.display(),
+                    s.code().unwrap_or(-1)
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", local.display(), e));
+            }
+        }
+
+        let _ = tx.send(WorkerMsg::Progress {
+            done: i + 1,
+            total: total_transfers,
+            file: local.to_string_lossy().to_string(),
         });
     }
 
