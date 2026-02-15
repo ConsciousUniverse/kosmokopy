@@ -167,6 +167,10 @@ fn build_ui(app: &Application) {
     chk_overwrite.set_active(false);
     root.append(&chk_overwrite);
 
+    let chk_strip_spaces = CheckButton::with_label("Remove spaces from filenames");
+    chk_strip_spaces.set_active(false);
+    root.append(&chk_strip_spaces);
+
     root.append(&Separator::new(Orientation::Horizontal));
 
     // ── Progress area ─────────────────────────────────────────────────
@@ -370,6 +374,7 @@ fn build_ui(app: &Application) {
         let chk_move = chk_move.clone();
         let chk_folders_files = chk_folders_files.clone();
         let chk_overwrite = chk_overwrite.clone();
+        let chk_strip_spaces = chk_strip_spaces.clone();
         let exclusions = exclusions.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
@@ -404,6 +409,7 @@ fn build_ui(app: &Application) {
 
             let do_move = chk_move.is_active();
             let overwrite = chk_overwrite.is_active();
+            let strip_spaces = chk_strip_spaces.is_active();
             let transfer_mode = if chk_folders_files.is_active() {
                 TransferMode::FoldersAndFiles
             } else {
@@ -428,11 +434,11 @@ fn build_ui(app: &Application) {
                 match remote_host {
                     Some(host) => run_remote_worker(
                         source_sel, &host, &dest_path, do_move, overwrite,
-                        transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, tx,
                     ),
                     None => run_worker(
                         source_sel, dest_path, do_move, overwrite,
-                        transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, tx,
                     ),
                 }
             });
@@ -663,6 +669,23 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Strip spaces from path components beyond the base destination directory.
+fn strip_spaces_from_path(base: &Path, full: &Path) -> PathBuf {
+    match full.strip_prefix(base) {
+        Ok(rel) => {
+            let cleaned: PathBuf = rel
+                .components()
+                .map(|c| {
+                    let s = c.as_os_str().to_string_lossy();
+                    std::ffi::OsString::from(s.replace(' ', ""))
+                })
+                .collect();
+            base.join(cleaned)
+        }
+        Err(_) => full.to_path_buf(),
+    }
+}
+
 // ── File collection (shared by local & remote workers) ─────────────────
 
 fn collect_files(
@@ -721,6 +744,7 @@ fn run_worker(
     dst: String,
     do_move: bool,
     overwrite: bool,
+    strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
     tx: mpsc::Sender<WorkerMsg>,
@@ -791,6 +815,13 @@ fn run_worker(
                 };
                 dst_path.join(fname)
             }
+        };
+
+        // Strip spaces from the destination path components if requested
+        let dest_file = if strip_spaces {
+            strip_spaces_from_path(&dst_path, &dest_file)
+        } else {
+            dest_file
         };
 
         // Create parent directory in destination
@@ -922,6 +953,7 @@ fn run_remote_worker(
     remote_base: &str,
     do_move: bool,
     overwrite: bool,
+    strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
     tx: mpsc::Sender<WorkerMsg>,
@@ -1006,6 +1038,12 @@ fn run_remote_worker(
             },
         };
         let remote_file = format!("{}/{}", remote_base, rel_dest);
+        // Strip spaces from the remote path if requested
+        let remote_file = if strip_spaces {
+            remote_file.split('/').map(|c| c.replace(' ', "")).collect::<Vec<_>>().join("/")
+        } else {
+            remote_file
+        };
         if let Some(parent) = Path::new(&remote_file).parent() {
             remote_dirs.insert(parent.to_string_lossy().to_string());
         }
