@@ -2,44 +2,53 @@
 
 A GTK4 file copier and mover with filtering, integrity verification, and SSH remote transfer support.
 
+IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy your data. TEST AT YOUR OWN RISK!
+
 ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue) ![License](https://img.shields.io/badge/license-GPLv3-blue)
 
 ## Features
 
 ### Source Selection
+
 - **Browse Folder** — select a directory and recursively process all files within it
 - **Browse Files** — pick individual files for transfer
 
 ### Transfer Modes
+
 - **Copy** — duplicate files to the destination
 - **Move** — transfer files to the destination and remove the originals
 - **Files Only** — flatten all files into the destination directory (no subdirectories)
 - **Folders and Files** — preserve the original directory structure at the destination
 
 ### Exclusions
+
 - **Exclude Directories** — pick directories to skip (all contents are excluded recursively)
 - **Exclude Files** — pick individual filenames to skip wherever they appear
 - **Clear** — remove all exclusion rules
 - Exclusions are displayed in a read-only scrollable list
 
 ### Overwrite Handling
+
 Kosmokopy compares source and destination files byte-by-byte before deciding what to do:
 
-| Destination file | Content | Copy mode | Move mode |
-|---|---|---|---|
-| Doesn't exist | — | Copy normally | Move normally |
-| Exists, identical | Same bytes | Skip ("identical at destination") | Delete source only (no transfer needed) |
-| Exists, different | Different + overwrite **on** | Overwrite with new version | Overwrite, then delete source |
-| Exists, different | Different + overwrite **off** | Skip ("different version exists") | Skip |
+| Destination file  | Content                            | Copy mode                         | Move mode                               |
+| ----------------- | ---------------------------------- | --------------------------------- | --------------------------------------- |
+| Doesn't exist     | —                                 | Copy normally                     | Move normally                           |
+| Exists, identical | Same bytes                         | Skip ("identical at destination") | Delete source only (no transfer needed) |
+| Exists, different | Different + overwrite**on**  | Overwrite with new version        | Overwrite, then delete source           |
+| Exists, different | Different + overwrite**off** | Skip ("different version exists") | Skip                                    |
 
 ### Integrity Verification
+
 - Every file copy is verified byte-by-byte against the source
 - If verification fails on copy, the bad copy is removed
 - If verification fails on move, the original is retained
 - Same-filesystem moves use `rename()` (instant pointer change, no data copied)
 
 ### SSH Remote Transfers
+
 Transfer files to remote machines using SSH config hosts:
+
 - Type `hostname:/remote/path` in the destination field (e.g. `ubuntu:/home/dan/backup`)
 - The hostname must match an entry in `~/.ssh/config`
 - Uses SSH connection multiplexing for performance
@@ -49,6 +58,7 @@ Transfer files to remote machines using SSH config hosts:
 - Integrity is guaranteed by the SSH protocol
 
 ### Progress and Reporting
+
 - Real-time progress bar showing file count and current filename
 - Completion dialog with summary of copied, skipped, and excluded files
 - Detailed skip reasons (identical, already exists, different version)
@@ -57,26 +67,31 @@ Transfer files to remote machines using SSH config hosts:
 ## Requirements
 
 ### Build Dependencies
+
 - Rust toolchain (edition 2021, Cargo 1.70+)
 - GTK4 development libraries
 
 #### macOS
+
 ```bash
 brew install gtk4
 ```
 
 #### Ubuntu / Debian
+
 ```bash
 sudo apt install libgtk-4-dev build-essential
 ```
 
 ### Runtime Dependencies
+
 - GTK4 runtime libraries
 - `ssh` and `scp` (only for remote transfers — present on any system with SSH configured)
 
 ## Building
 
 ### From Source
+
 ```bash
 cargo build --release
 ```
@@ -84,6 +99,7 @@ cargo build --release
 The binary is at `target/release/kosmokopy`.
 
 ### macOS (.dmg)
+
 ```bash
 ./macos/build-dmg.sh
 ```
@@ -93,6 +109,7 @@ Creates `target/macos/Kosmokopy-0.1.0-arm64.dmg` containing a drag-to-install `.
 > **Note:** GTK4 must be installed via Homebrew on the target Mac.
 
 ### Linux (AppImage)
+
 ```bash
 ./appimage/build-appimage.sh
 ```
