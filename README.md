@@ -6,6 +6,10 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue) ![License](https://img.shields.io/badge/license-GPLv3-blue)
 
+## Screenshot
+
+![Kosmokopy screenshot](image/README/1771161664734.png)
+
 ## Features
 
 ### Source Selection
