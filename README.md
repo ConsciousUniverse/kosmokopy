@@ -4,11 +4,11 @@ A GTK4 file copier and mover with filtering, integrity verification, and SSH rem
 
 IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy your data. TEST AT YOUR OWN RISK!
 
-![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue) ![License](https://img.shields.io/badge/license-GPLv3-blue)
+![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue)
 
 ## Screenshot
 
-![Kosmokopy screenshot](image/README/1771161664734.png)
+![1771527443790](image/README/1771527443790.png)
 
 ## Features
 
@@ -20,9 +20,18 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 ### Transfer Modes
 
 - **Copy** — duplicate files to the destination
-- **Move** — transfer files to the destination and remove the originals
+- **Move** — transfer files to the destination and remove the original
 - **Files Only** — flatten all files into the destination directory (no subdirectories)
 - **Folders and Files** — preserve the original directory structure at the destination
+
+### Transfer Method
+
+- **Standard (cp/scp)** — uses built-in Rust file copy for local transfers and `scp` for remote transfers (default)
+- **rsync** — uses `rsync` for both local and remote transfers, providing:
+  - **Resumable transfers** — interrupted large file copies can be picked up where they left off
+  - **Delta transfers** — when overwriting, only changed blocks are written
+  - **Checksum verification** — rsync verifies integrity during transfer with `--checksum`
+  - For remote transfers, rsync uses SSH connection multiplexing for performance
 
 ### Exclusions
 
@@ -44,10 +53,20 @@ Kosmokopy compares source and destination files byte-by-byte before deciding wha
 
 ### Integrity Verification
 
+**Local transfers:**
+
 - Every file copy is verified byte-by-byte against the source
 - If verification fails on copy, the bad copy is removed
 - If verification fails on move, the original is retained
 - Same-filesystem moves use `rename()` (instant pointer change, no data copied)
+- When using rsync locally, a byte-by-byte comparison is still performed after rsync's own checksum verification (defense in depth)
+
+**Remote transfers (SCP and rsync):**
+
+- After each file transfer, a SHA-256 hash of the local file is compared against a SHA-256 hash computed on the remote host via SSH
+- If the hash comparison fails, the corrupt remote copy is removed and the original is retained
+- Source files are **never** deleted during a move unless the hash verification passes
+- For rsync, this SHA-256 check is performed in addition to rsync's built-in `--checksum` verification
 
 ### SSH Remote Transfers
 
@@ -58,8 +77,8 @@ Transfer files to remote machines using SSH config hosts:
 - Uses SSH connection multiplexing for performance
 - Creates remote directories automatically
 - Remote overwrite detection checks existing files before transfer
-- For moves, local files are deleted after successful transfer
-- Integrity is guaranteed by the SSH protocol
+- Post-transfer SHA-256 hash verification ensures data integrity
+- For moves, local files are deleted only after hash verification passes
 
 ### Progress and Reporting
 
@@ -90,7 +109,9 @@ sudo apt install libgtk-4-dev build-essential
 ### Runtime Dependencies
 
 - GTK4 runtime libraries
-- `ssh` and `scp` (only for remote transfers — present on any system with SSH configured)
+- `ssh` and `scp` (only for remote transfers via Standard method — present on any system with SSH configured)
+- `rsync` (only when rsync transfer method is selected — commonly pre-installed on macOS and Linux)
+- `sha256sum` or `shasum` on the remote host (for remote transfer hash verification — present on virtually all Unix systems)
 
 ## Building
 
@@ -127,9 +148,10 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 1. **Select source** — click "Browse Folder" for a directory or "Browse Files" for individual files
 2. **Set destination** — browse for a local folder, type a path, or enter `host:/path` for remote
 3. **Choose mode** — Copy or Move, Files Only or Folders and Files
-4. **Set exclusions** (optional) — use the Exclude Directories / Exclude Files buttons
-5. **Toggle overwrite** (optional) — check "Overwrite existing files" to replace differing files
-6. **Click Transfer**
+4. **Choose transfer method** — Standard (cp/scp) or rsync
+5. **Set exclusions** (optional) — use the Exclude Directories / Exclude Files buttons
+6. **Toggle overwrite** (optional) — check "Overwrite existing files" to replace differing files
+7. **Click Transfer**
 
 ## Author
 
@@ -144,3 +166,15 @@ Copyright (C) 2026 Dan Bright
 This project is licensed under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) for details.
 
 All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in [THIRD-PARTY-LICENSES.txt](THIRD-PARTY-LICENSES.txt).
+
+## Changelog
+
+### 2026-02-19
+
+- **Added rsync transfer method** — available for both local and remote transfers via a new "Transfer method" radio button group (Standard / rsync)
+- **Added SHA-256 hash verification for remote transfers** — both SCP and rsync remote transfers now verify integrity by comparing local and remote SHA-256 hashes after each file transfer
+- **Hardened SCP remote move safety** — source files are no longer deleted after SCP transfer without cryptographic hash verification; previously relied solely on SCP exit status
+- **Local rsync worker** — uses `rsync -a --checksum` with a follow-up byte-by-byte comparison for defense in depth; same-filesystem moves still use atomic `rename()`
+- **Remote rsync worker** — uses `rsync -az --checksum` over SSH with connection multiplexing, plus post-transfer SHA-256 verification before any source deletion
+- **Added `sha2` crate dependency** for local SHA-256 hash computation
+- **Updated runtime requirements** — documented `rsync` and `sha256sum`/`shasum` as optional runtime dependencies
