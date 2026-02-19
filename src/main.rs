@@ -5,7 +5,7 @@
 // This code was primarily authored using artificial intelligence
 // (Claude Opus 4.6 model).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -52,10 +52,222 @@ enum TransferMethod {
     Rsync,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ConflictMode {
+    Skip,
+    Overwrite,
+    Rename,
+}
+
 fn main() -> glib::ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--cli" {
+        std::process::exit(run_cli(&args[2..]));
+    }
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
     app.run()
+}
+
+// ── CLI (headless) mode ────────────────────────────────────────────────
+
+/// Run a transfer from the command line, printing JSON results to stdout.
+///
+/// Usage:
+///   kosmokopy --cli [OPTIONS]
+///
+/// Required:
+///   --src <path|host:/path>      Source directory or remote
+///   --dst <path|host:/path>      Destination directory or remote
+///
+/// Optional:
+///   --move                       Move instead of copy
+///   --conflict <skip|overwrite|rename>   Conflict mode (default: skip)
+///   --strip-spaces               Remove spaces from filenames
+///   --mode <files|folders>       Transfer mode (default: folders)
+///   --method <standard|rsync>    Transfer method (default: standard)
+///   --exclude <pattern>          Exclusion pattern (repeatable)
+///   --src-files <file1,file2>    Comma-separated list of individual source files
+fn run_cli(args: &[String]) -> i32 {
+    let mut src: Option<String> = None;
+    let mut dst: Option<String> = None;
+    let mut do_move = false;
+    let mut conflict_mode = ConflictMode::Skip;
+    let mut strip_spaces = false;
+    let mut transfer_mode = TransferMode::FoldersAndFiles;
+    let mut transfer_method = TransferMethod::Standard;
+    let mut patterns: Vec<String> = Vec::new();
+    let mut src_files: Option<Vec<PathBuf>> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--src" => {
+                i += 1;
+                src = args.get(i).cloned();
+            }
+            "--dst" => {
+                i += 1;
+                dst = args.get(i).cloned();
+            }
+            "--move" => do_move = true,
+            "--conflict" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    conflict_mode = match val.as_str() {
+                        "overwrite" => ConflictMode::Overwrite,
+                        "rename" => ConflictMode::Rename,
+                        _ => ConflictMode::Skip,
+                    };
+                }
+            }
+            "--strip-spaces" => strip_spaces = true,
+            "--mode" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    transfer_mode = match val.as_str() {
+                        "files" => TransferMode::FilesOnly,
+                        _ => TransferMode::FoldersAndFiles,
+                    };
+                }
+            }
+            "--method" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    transfer_method = match val.as_str() {
+                        "rsync" => TransferMethod::Rsync,
+                        _ => TransferMethod::Standard,
+                    };
+                }
+            }
+            "--exclude" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    patterns.push(val.clone());
+                }
+            }
+            "--src-files" => {
+                i += 1;
+                if let Some(val) = args.get(i) {
+                    src_files = Some(
+                        val.split(',')
+                            .map(|s| PathBuf::from(s.trim()))
+                            .collect(),
+                    );
+                }
+            }
+            other => {
+                eprintln!("Unknown option: {}", other);
+                return 1;
+            }
+        }
+        i += 1;
+    }
+
+    let dst = match dst {
+        Some(d) => d,
+        None => {
+            eprintln!("--dst is required");
+            return 1;
+        }
+    };
+
+    // Build source selection
+    let source_sel = if let Some(files) = src_files {
+        SourceSelection::Files(files)
+    } else if let Some(s) = src {
+        let (host, path) = parse_destination(&s);
+        match host {
+            Some(h) => SourceSelection::Remote(h, path),
+            None => SourceSelection::Directory(PathBuf::from(path)),
+        }
+    } else {
+        eprintln!("--src or --src-files is required");
+        return 1;
+    };
+
+    let (tx, rx) = mpsc::channel::<WorkerMsg>();
+
+    let src_is_remote = matches!(&source_sel, SourceSelection::Remote(_, _));
+    let (dst_host, dest_path) = parse_destination(&dst);
+
+    match (src_is_remote, dst_host, transfer_method) {
+        (true, Some(dhost), TransferMethod::Standard) => {
+            if let SourceSelection::Remote(shost, spath) = &source_sel {
+                run_remote_to_remote_worker(
+                    shost, spath, &dhost, &dest_path, do_move, conflict_mode,
+                    strip_spaces, transfer_mode, &patterns, tx,
+                );
+            }
+        }
+        (true, Some(dhost), TransferMethod::Rsync) => {
+            if let SourceSelection::Remote(shost, spath) = &source_sel {
+                run_remote_to_remote_rsync_worker(
+                    shost, spath, &dhost, &dest_path, do_move, conflict_mode,
+                    strip_spaces, transfer_mode, &patterns, tx,
+                );
+            }
+        }
+        (true, None, method) => {
+            if let SourceSelection::Remote(shost, spath) = &source_sel {
+                run_remote_to_local_worker(
+                    shost, spath, &dest_path, do_move, conflict_mode,
+                    strip_spaces, transfer_mode, &patterns, method, tx,
+                );
+            }
+        }
+        (false, Some(host), TransferMethod::Standard) => run_remote_worker(
+            source_sel, &host, &dest_path, do_move, conflict_mode,
+            strip_spaces, transfer_mode, &patterns, tx,
+        ),
+        (false, Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
+            source_sel, &host, &dest_path, do_move, conflict_mode,
+            strip_spaces, transfer_mode, &patterns, tx,
+        ),
+        (false, None, TransferMethod::Rsync) => run_local_rsync_worker(
+            source_sel, dest_path, do_move, conflict_mode,
+            strip_spaces, transfer_mode, &patterns, tx,
+        ),
+        (false, None, TransferMethod::Standard) => run_worker(
+            source_sel, dest_path, do_move, conflict_mode,
+            strip_spaces, transfer_mode, &patterns, tx,
+        ),
+    }
+
+    // Collect results from the worker
+    for msg in rx {
+        match msg {
+            WorkerMsg::Finished { copied, skipped, excluded_files, excluded_dirs, errors } => {
+                // Output JSON result
+                let skipped_json: Vec<String> = skipped.iter()
+                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                let errors_json: Vec<String> = errors.iter()
+                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                println!(
+                    "{{\"status\":\"finished\",\"copied\":{},\"skipped\":[{}],\"excluded_files\":{},\"excluded_dirs\":{},\"errors\":[{}]}}",
+                    copied,
+                    skipped_json.join(","),
+                    excluded_files,
+                    excluded_dirs,
+                    errors_json.join(","),
+                );
+                return if errors.is_empty() { 0 } else { 2 };
+            }
+            WorkerMsg::Error(e) => {
+                let escaped = e.replace('\\', "\\\\").replace('"', "\\\"");
+                println!("{{\"status\":\"error\",\"message\":\"{}\"}}", escaped);
+                return 1;
+            }
+            WorkerMsg::Progress { .. } => {
+                // Silently consume progress messages in CLI mode
+            }
+        }
+    }
+
+    eprintln!("Worker channel closed without result");
+    1
 }
 
 // ── Messages from worker thread to UI ──────────────────────────────────
@@ -69,7 +281,8 @@ enum WorkerMsg {
     Finished {
         copied: usize,
         skipped: Vec<String>,
-        excluded: usize,
+        excluded_files: usize,
+        excluded_dirs: usize,
         errors: Vec<String>,
     },
     Error(String),
@@ -115,9 +328,9 @@ fn build_ui(app: &Application) {
 
     // Remote source entry
     let src_remote_row = GtkBox::new(Orientation::Horizontal, 8);
-    let src_remote_label = Label::new(Some("Remote source:"));
-    src_remote_label.set_width_chars(14);
-    src_remote_label.set_halign(Align::Start);
+    let src_remote_label = Label::new(Some("Remote Source:"));
+    src_remote_label.set_width_chars(20);
+    src_remote_label.set_xalign(0.0);
     let src_remote_entry = Entry::new();
     src_remote_entry.set_hexpand(true);
     src_remote_entry.set_placeholder_text(Some("host:/remote/path (overrides local source)"));
@@ -208,10 +421,22 @@ fn build_ui(app: &Application) {
     // wildcard dir patterns as "~/pattern", wildcard file patterns as "~pattern"
     let exclusions: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // ── Overwrite toggle ─────────────────────────────────────────────
-    let chk_overwrite = CheckButton::with_label("Overwrite existing files");
-    chk_overwrite.set_active(false);
-    root.append(&chk_overwrite);
+    // ── Conflict handling ──────────────────────────────────────────
+    let conflict_label = Label::new(Some("If file already exists:"));
+    conflict_label.set_halign(Align::Start);
+    root.append(&conflict_label);
+
+    let conflict_row = GtkBox::new(Orientation::Horizontal, 12);
+    let chk_skip = CheckButton::with_label("Skip");
+    chk_skip.set_active(true);
+    let chk_overwrite = CheckButton::with_label("Overwrite");
+    chk_overwrite.set_group(Some(&chk_skip));
+    let chk_rename = CheckButton::with_label("Auto-rename");
+    chk_rename.set_group(Some(&chk_skip));
+    conflict_row.append(&chk_skip);
+    conflict_row.append(&chk_overwrite);
+    conflict_row.append(&chk_rename);
+    root.append(&conflict_row);
 
     let chk_strip_spaces = CheckButton::with_label("Remove spaces from filenames");
     chk_strip_spaces.set_active(false);
@@ -461,6 +686,7 @@ fn build_ui(app: &Application) {
         let chk_move = chk_move.clone();
         let chk_folders_files = chk_folders_files.clone();
         let chk_overwrite = chk_overwrite.clone();
+        let chk_rename = chk_rename.clone();
         let chk_strip_spaces = chk_strip_spaces.clone();
         let chk_rsync = chk_rsync.clone();
         let src_remote_entry = src_remote_entry.clone();
@@ -512,7 +738,13 @@ fn build_ui(app: &Application) {
             }
 
             let do_move = chk_move.is_active();
-            let overwrite = chk_overwrite.is_active();
+            let conflict_mode = if chk_overwrite.is_active() {
+                ConflictMode::Overwrite
+            } else if chk_rename.is_active() {
+                ConflictMode::Rename
+            } else {
+                ConflictMode::Skip
+            };
             let strip_spaces = chk_strip_spaces.is_active();
             let transfer_mode = if chk_folders_files.is_active() {
                 TransferMode::FoldersAndFiles
@@ -546,7 +778,7 @@ fn build_ui(app: &Application) {
                     (true, Some(dhost), TransferMethod::Standard) => {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_remote_worker(
-                                shost, &spath, &dhost, &dest_path, do_move, overwrite,
+                                shost, &spath, &dhost, &dest_path, do_move, conflict_mode,
                                 strip_spaces, transfer_mode, &patterns, tx,
                             );
                         }
@@ -554,7 +786,7 @@ fn build_ui(app: &Application) {
                     (true, Some(dhost), TransferMethod::Rsync) => {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_remote_rsync_worker(
-                                shost, &spath, &dhost, &dest_path, do_move, overwrite,
+                                shost, &spath, &dhost, &dest_path, do_move, conflict_mode,
                                 strip_spaces, transfer_mode, &patterns, tx,
                             );
                         }
@@ -563,27 +795,27 @@ fn build_ui(app: &Application) {
                     (true, None, transfer_method) => {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_local_worker(
-                                shost, &spath, &dest_path, do_move, overwrite,
+                                shost, &spath, &dest_path, do_move, conflict_mode,
                                 strip_spaces, transfer_mode, &patterns, transfer_method, tx,
                             );
                         }
                     }
                     // Local source → remote destination
                     (false, Some(host), TransferMethod::Standard) => run_remote_worker(
-                        source_sel, &host, &dest_path, do_move, overwrite,
+                        source_sel, &host, &dest_path, do_move, conflict_mode,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
                     (false, Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
-                        source_sel, &host, &dest_path, do_move, overwrite,
+                        source_sel, &host, &dest_path, do_move, conflict_mode,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
                     // Local source → local destination
                     (false, None, TransferMethod::Rsync) => run_local_rsync_worker(
-                        source_sel, dest_path, do_move, overwrite,
+                        source_sel, dest_path, do_move, conflict_mode,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
                     (false, None, TransferMethod::Standard) => run_worker(
-                        source_sel, dest_path, do_move, overwrite,
+                        source_sel, dest_path, do_move, conflict_mode,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
                 }
@@ -616,14 +848,27 @@ fn build_ui(app: &Application) {
                         WorkerMsg::Finished {
                             copied,
                             skipped,
-                            excluded,
+                            excluded_files,
+                            excluded_dirs,
                             errors,
                         } => {
                             progress_bar_c.set_fraction(1.0);
                             let verb = if do_move { "Moved" } else { "Copied" };
+                            let mut excl_parts = Vec::new();
+                            if excluded_files > 0 {
+                                excl_parts.push(format!("{} file(s)", excluded_files));
+                            }
+                            if excluded_dirs > 0 {
+                                excl_parts.push(format!("{} dir(s)", excluded_dirs));
+                            }
+                            let excl_str = if excl_parts.is_empty() {
+                                "0".to_string()
+                            } else {
+                                excl_parts.join(", ")
+                            };
                             let summary = format!(
                                 "{} {} file(s), {} skipped, {} excluded.",
-                                verb, copied, skipped.len(), excluded
+                                verb, copied, skipped.len(), excl_str
                             );
                             progress_bar_c.set_text(Some("Complete"));
                             status_label_c.set_text(&summary);
@@ -679,7 +924,7 @@ fn dir_row_editable(label_text: &str) -> (GtkBox, Button, Entry) {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     let label = Label::new(Some(label_text));
     label.set_width_chars(20);
-    label.set_halign(Align::Start);
+    label.set_xalign(0.0);
 
     let entry = Entry::new();
     entry.set_hexpand(true);
@@ -821,6 +1066,70 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Find a unique local path by appending " (1)", " (2)", etc. before the extension.
+fn find_unique_local_path(original: &Path) -> PathBuf {
+    let parent = original.parent().unwrap_or_else(|| Path::new("."));
+    let stem = original.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = original.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let candidate = parent.join(format!("{} ({}){}", stem, n, ext));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Find a unique remote path by appending " (1)", " (2)", etc. before the extension.
+/// Checks existence via SSH.
+#[allow(dead_code)]
+fn find_unique_remote_path(
+    original: &str,
+    host: &str,
+    ctl: &[&str],
+) -> String {
+    let path = Path::new(original);
+    let parent = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy().to_string();
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{}/{} ({}){}", parent, stem, n, ext);
+        let check = Command::new("ssh")
+            .args(ctl)
+            .arg(host)
+            .arg(format!("test -e {}", shell_quote(&candidate)))
+            .status();
+        match check {
+            Ok(s) if s.success() => {
+                // exists, try next number
+                n += 1;
+            }
+            _ => return candidate,
+        }
+    }
+}
+
+/// Find a unique remote path using the pre-fetched set of existing files.
+fn find_unique_remote_path_from_set(
+    original: &str,
+    existing: &HashSet<String>,
+) -> String {
+    let path = Path::new(original);
+    let parent = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy().to_string();
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let candidate = format!("{}/{} ({}){}", parent, stem, n, ext);
+        if !existing.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Strip spaces from path components beyond the base destination directory.
 fn strip_spaces_from_path(base: &Path, full: &Path) -> PathBuf {
     match full.strip_prefix(base) {
@@ -868,11 +1177,11 @@ fn wildcard_match_inner(pattern: &[char], name: &[char]) -> bool {
 fn collect_files(
     source: &SourceSelection,
     patterns: &[String],
-) -> Result<(Vec<PathBuf>, usize), String> {
+) -> Result<(Vec<PathBuf>, usize, usize), String> {
     match source {
         SourceSelection::None => Err("No source selected.".to_string()),
         SourceSelection::Remote(_, _) => Err("Remote source uses its own file listing.".to_string()),
-        SourceSelection::Files(paths) => Ok((paths.clone(), 0)),
+        SourceSelection::Files(paths) => Ok((paths.clone(), 0, 0)),
         SourceSelection::Directory(src_dir) => {
             // Exact directory exclusions: "/dirname"
             let excluded_dirs: HashSet<String> = patterns
@@ -901,7 +1210,8 @@ fn collect_files(
 
             let src_dir = src_dir.clone();
             let mut collected = Vec::new();
-            let mut excluded_count = 0usize;
+            let mut excluded_file_count = 0usize;
+            let excluded_dir_count = Cell::new(0usize);
             for entry in WalkDir::new(&src_dir).into_iter().filter_entry(|e| {
                 if e.path() == src_dir.as_path() {
                     return true;
@@ -909,9 +1219,11 @@ fn collect_files(
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy().to_string();
                     if excluded_dirs.contains(&name) {
+                        excluded_dir_count.set(excluded_dir_count.get() + 1);
                         return false;
                     }
                     if wildcard_dirs.iter().any(|pat| wildcard_matches(pat, &name)) {
+                        excluded_dir_count.set(excluded_dir_count.get() + 1);
                         return false;
                     }
                     return true;
@@ -924,7 +1236,7 @@ fn collect_files(
                         if excluded_files.contains(&name)
                             || wildcard_files.iter().any(|pat| wildcard_matches(pat, &name))
                         {
-                            excluded_count += 1;
+                            excluded_file_count += 1;
                         } else {
                             collected.push(e.into_path());
                         }
@@ -932,7 +1244,7 @@ fn collect_files(
                     _ => {}
                 }
             }
-            Ok((collected, excluded_count))
+            Ok((collected, excluded_file_count, excluded_dir_count.get()))
         }
     }
 }
@@ -943,7 +1255,7 @@ fn run_worker(
     source: SourceSelection,
     dst: String,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -963,7 +1275,7 @@ fn run_worker(
     }
 
     // Collect the files to process
-    let (files, excluded) = match collect_files(&source, patterns) {
+    let (files, excluded_files, excluded_dirs) = match collect_files(&source, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -976,7 +1288,8 @@ fn run_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -1018,7 +1331,7 @@ fn run_worker(
         };
 
         // Strip spaces from the destination path components if requested
-        let dest_file = if strip_spaces {
+        let mut dest_file = if strip_spaces {
             strip_spaces_from_path(&dst_path, &dest_file)
         } else {
             dest_file
@@ -1055,17 +1368,23 @@ fn run_worker(
                     continue;
                 }
                 Ok(false) => {
-                    // File differs — skip if overwrite is off
-                    if !overwrite {
-                        skipped.push(format!("{}: different version exists at destination", file_path.display()));
-                        let _ = tx.send(WorkerMsg::Progress {
-                            done: i + 1,
-                            total,
-                            file: file_path.to_string_lossy().to_string(),
-                        });
-                        continue;
+                    match conflict_mode {
+                        ConflictMode::Skip => {
+                            skipped.push(format!("{}: different version exists at destination", file_path.display()));
+                            let _ = tx.send(WorkerMsg::Progress {
+                                done: i + 1,
+                                total,
+                                file: file_path.to_string_lossy().to_string(),
+                            });
+                            continue;
+                        }
+                        ConflictMode::Rename => {
+                            dest_file = find_unique_local_path(&dest_file);
+                        }
+                        ConflictMode::Overwrite => {
+                            // fall through to overwrite
+                        }
                     }
-                    // Otherwise fall through to overwrite
                 }
                 Err(e) => {
                     errors.push(format!("{}: could not compare with destination: {}", file_path.display(), e));
@@ -1140,7 +1459,8 @@ fn run_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -1151,7 +1471,7 @@ fn run_local_rsync_worker(
     source: SourceSelection,
     dst: String,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -1182,7 +1502,7 @@ fn run_local_rsync_worker(
     }
 
     // Collect the files to process
-    let (files, excluded) = match collect_files(&source, patterns) {
+    let (files, excluded_files, excluded_dirs) = match collect_files(&source, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -1195,7 +1515,8 @@ fn run_local_rsync_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -1233,7 +1554,7 @@ fn run_local_rsync_worker(
         };
 
         // Strip spaces if requested
-        let dest_file = if strip_spaces {
+        let mut dest_file = if strip_spaces {
             strip_spaces_from_path(&dst_path, &dest_file)
         } else {
             dest_file
@@ -1272,17 +1593,25 @@ fn run_local_rsync_worker(
                     continue;
                 }
                 Ok(false) => {
-                    if !overwrite {
-                        skipped.push(format!(
-                            "{}: different version exists at destination",
-                            file_path.display()
-                        ));
-                        let _ = tx.send(WorkerMsg::Progress {
-                            done: i + 1,
-                            total,
-                            file: file_path.to_string_lossy().to_string(),
-                        });
-                        continue;
+                    match conflict_mode {
+                        ConflictMode::Skip => {
+                            skipped.push(format!(
+                                "{}: different version exists at destination",
+                                file_path.display()
+                            ));
+                            let _ = tx.send(WorkerMsg::Progress {
+                                done: i + 1,
+                                total,
+                                file: file_path.to_string_lossy().to_string(),
+                            });
+                            continue;
+                        }
+                        ConflictMode::Rename => {
+                            dest_file = find_unique_local_path(&dest_file);
+                        }
+                        ConflictMode::Overwrite => {
+                            // fall through to overwrite
+                        }
                     }
                 }
                 Err(e) => {
@@ -1385,7 +1714,8 @@ fn run_local_rsync_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -1397,7 +1727,7 @@ fn run_remote_worker(
     host: &str,
     remote_base: &str,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -1431,7 +1761,7 @@ fn run_remote_worker(
     }
 
     // Collect files locally
-    let (files, excluded) = match collect_files(&source, patterns) {
+    let (files, excluded_files, excluded_dirs) = match collect_files(&source, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -1444,7 +1774,8 @@ fn run_remote_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -1512,8 +1843,8 @@ fn run_remote_worker(
         }
     }
 
-    // If !overwrite, get list of existing remote files in one SSH call
-    let existing: HashSet<String> = if !overwrite {
+    // If not overwriting, get list of existing remote files in one SSH call
+    let existing: HashSet<String> = if conflict_mode != ConflictMode::Overwrite {
         let out = Command::new("ssh")
             .args(&ctl)
             .arg(host)
@@ -1536,19 +1867,29 @@ fn run_remote_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (local, remote)) in transfers.iter().enumerate() {
-        // Skip if file exists remotely and overwrite is off
-        if !overwrite && existing.contains(remote) {
-            skipped.push(format!(
-                "{}: already exists at destination",
-                local.display()
-            ));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total: total_transfers,
-                file: local.to_string_lossy().to_string(),
-            });
-            continue;
-        }
+        // Handle conflict if file exists remotely
+        let remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(remote) {
+            match conflict_mode {
+                ConflictMode::Skip => {
+                    skipped.push(format!(
+                        "{}: already exists at destination",
+                        local.display()
+                    ));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total: total_transfers,
+                        file: local.to_string_lossy().to_string(),
+                    });
+                    continue;
+                }
+                ConflictMode::Rename => {
+                    std::borrow::Cow::Owned(find_unique_remote_path_from_set(remote, &existing))
+                }
+                ConflictMode::Overwrite => unreachable!(),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(remote.as_str())
+        };
 
         // Transfer via scp
         let scp_result = Command::new("scp")
@@ -1561,7 +1902,7 @@ fn run_remote_worker(
         match scp_result {
             Ok(s) if s.success() => {
                 // Verify integrity with SHA-256 hash comparison
-                match verify_remote_hash(local, host, &ctl, remote) {
+                match verify_remote_hash(local, host, &ctl, &remote) {
                     Ok(true) => {
                         copied += 1;
                         if do_move {
@@ -1579,7 +1920,7 @@ fn run_remote_worker(
                         let _ = Command::new("ssh")
                             .args(&ctl)
                             .arg(host)
-                            .arg(format!("rm -f {}", shell_quote(remote)))
+                            .arg(format!("rm -f {}", shell_quote(&remote)))
                             .status();
                         errors.push(format!(
                             "{}: integrity check failed — hash mismatch (original retained, remote copy removed)",
@@ -1626,7 +1967,8 @@ fn run_remote_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -1666,7 +2008,7 @@ fn collect_remote_files(
     ctl: &[&str],
     remote_base: &str,
     patterns: &[String],
-) -> Result<(Vec<String>, usize), String> {
+) -> Result<(Vec<String>, usize, usize), String> {
     let out = Command::new("ssh")
         .args(ctl)
         .arg(host)
@@ -1705,7 +2047,8 @@ fn collect_remote_files(
 
     let remote_base_slash = format!("{}/", remote_base.trim_end_matches('/'));
     let mut collected = Vec::new();
-    let mut excluded_count = 0usize;
+    let mut excluded_file_count = 0usize;
+    let mut excluded_dir_names: HashSet<String> = HashSet::new();
 
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim();
@@ -1733,11 +2076,11 @@ fn collect_remote_files(
                 || wildcard_dirs.iter().any(|pat| wildcard_matches(pat, part))
             {
                 dir_excluded = true;
+                excluded_dir_names.insert(part.to_string());
                 break;
             }
         }
         if dir_excluded {
-            excluded_count += 1;
             continue;
         }
 
@@ -1745,14 +2088,14 @@ fn collect_remote_files(
         if excluded_files.contains(*filename)
             || wildcard_files.iter().any(|pat| wildcard_matches(pat, filename))
         {
-            excluded_count += 1;
+            excluded_file_count += 1;
             continue;
         }
 
         collected.push(line.to_string());
     }
 
-    Ok((collected, excluded_count))
+    Ok((collected, excluded_file_count, excluded_dir_names.len()))
 }
 
 // ── Worker thread (remote source → local destination) ──────────────────
@@ -1762,7 +2105,7 @@ fn run_remote_to_local_worker(
     src_remote_base: &str,
     local_dst: &str,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -1797,7 +2140,7 @@ fn run_remote_to_local_worker(
     }
 
     // List remote source files
-    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+    let (remote_files, excluded_files, excluded_dirs) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -1810,7 +2153,8 @@ fn run_remote_to_local_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -1850,7 +2194,7 @@ fn run_remote_to_local_worker(
             }
         };
 
-        let local_dest = if strip_spaces {
+        let mut local_dest = if strip_spaces {
             strip_spaces_from_path(&dst_path, &local_dest)
         } else {
             local_dest
@@ -1864,15 +2208,25 @@ fn run_remote_to_local_worker(
             }
         }
 
-        // Check overwrite
-        if local_dest.exists() && !overwrite {
-            skipped.push(format!("{}: already exists at destination", remote_file));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total,
-                file: remote_file.clone(),
-            });
-            continue;
+        // Check conflict
+        if local_dest.exists() {
+            match conflict_mode {
+                ConflictMode::Skip => {
+                    skipped.push(format!("{}: already exists at destination", remote_file));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total,
+                        file: remote_file.clone(),
+                    });
+                    continue;
+                }
+                ConflictMode::Rename => {
+                    local_dest = find_unique_local_path(&local_dest);
+                }
+                ConflictMode::Overwrite => {
+                    // fall through
+                }
+            }
         }
 
         // Download from source
@@ -1959,7 +2313,8 @@ fn run_remote_to_local_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -1972,7 +2327,7 @@ fn run_remote_to_remote_worker(
     dst_host: &str,
     dst_remote_base: &str,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -2008,7 +2363,7 @@ fn run_remote_to_remote_worker(
     }
 
     // List remote source files
-    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+    let (remote_files, excluded_files, excluded_dirs) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -2021,7 +2376,8 @@ fn run_remote_to_remote_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -2096,8 +2452,8 @@ fn run_remote_to_remote_worker(
         }
     }
 
-    // If !overwrite, get existing files on destination
-    let existing: HashSet<String> = if !overwrite {
+    // If not overwriting, get existing files on destination
+    let existing: HashSet<String> = if conflict_mode != ConflictMode::Overwrite {
         let out = Command::new("ssh")
             .args(&ctl)
             .arg(dst_host)
@@ -2120,16 +2476,26 @@ fn run_remote_to_remote_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
-        // Skip if destination exists and overwrite is off
-        if !overwrite && existing.contains(dst_remote) {
-            skipped.push(format!("{}: already exists at destination", src_remote));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total: total_transfers,
-                file: src_remote.clone(),
-            });
-            continue;
-        }
+        // Handle conflict if destination exists
+        let dst_remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(dst_remote) {
+            match conflict_mode {
+                ConflictMode::Skip => {
+                    skipped.push(format!("{}: already exists at destination", src_remote));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total: total_transfers,
+                        file: src_remote.clone(),
+                    });
+                    continue;
+                }
+                ConflictMode::Rename => {
+                    std::borrow::Cow::Owned(find_unique_remote_path_from_set(dst_remote, &existing))
+                }
+                ConflictMode::Overwrite => unreachable!(),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(dst_remote.as_str())
+        };
 
         // Create local temp parent dir
         if let Some(parent) = local_temp.parent() {
@@ -2206,7 +2572,7 @@ fn run_remote_to_remote_worker(
         }
 
         // Verify upload
-        match verify_remote_hash(local_temp, dst_host, &ctl, dst_remote) {
+        match verify_remote_hash(local_temp, dst_host, &ctl, &dst_remote) {
             Ok(true) => {
                 copied += 1;
                 // Clean up local temp
@@ -2231,7 +2597,7 @@ fn run_remote_to_remote_worker(
                 let _ = Command::new("ssh")
                     .args(&ctl)
                     .arg(dst_host)
-                    .arg(format!("rm -f {}", shell_quote(dst_remote)))
+                    .arg(format!("rm -f {}", shell_quote(&dst_remote)))
                     .status();
                 errors.push(format!(
                     "{}: upload integrity check failed — hash mismatch (source retained, dest copy removed)",
@@ -2267,7 +2633,8 @@ fn run_remote_to_remote_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -2280,7 +2647,7 @@ fn run_remote_to_remote_rsync_worker(
     dst_host: &str,
     dst_remote_base: &str,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -2328,7 +2695,7 @@ fn run_remote_to_remote_rsync_worker(
     }
 
     // List remote source files
-    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+    let (remote_files, excluded_files, excluded_dirs) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -2341,7 +2708,8 @@ fn run_remote_to_remote_rsync_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -2413,7 +2781,7 @@ fn run_remote_to_remote_rsync_worker(
         }
     }
 
-    let existing: HashSet<String> = if !overwrite {
+    let existing: HashSet<String> = if conflict_mode != ConflictMode::Overwrite {
         let out = Command::new("ssh")
             .args(&ctl)
             .arg(dst_host)
@@ -2436,15 +2804,25 @@ fn run_remote_to_remote_rsync_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
-        if !overwrite && existing.contains(dst_remote) {
-            skipped.push(format!("{}: already exists at destination", src_remote));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total: total_transfers,
-                file: src_remote.clone(),
-            });
-            continue;
-        }
+        let dst_remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(dst_remote) {
+            match conflict_mode {
+                ConflictMode::Skip => {
+                    skipped.push(format!("{}: already exists at destination", src_remote));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total: total_transfers,
+                        file: src_remote.clone(),
+                    });
+                    continue;
+                }
+                ConflictMode::Rename => {
+                    std::borrow::Cow::Owned(find_unique_remote_path_from_set(dst_remote, &existing))
+                }
+                ConflictMode::Overwrite => unreachable!(),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(dst_remote.as_str())
+        };
 
         if let Some(parent) = local_temp.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
@@ -2522,7 +2900,7 @@ fn run_remote_to_remote_rsync_worker(
         }
 
         // Verify upload
-        match verify_remote_hash(local_temp, dst_host, &ctl, dst_remote) {
+        match verify_remote_hash(local_temp, dst_host, &ctl, &dst_remote) {
             Ok(true) => {
                 copied += 1;
                 let _ = fs::remove_file(local_temp);
@@ -2545,7 +2923,7 @@ fn run_remote_to_remote_rsync_worker(
                 let _ = Command::new("ssh")
                     .args(&ctl)
                     .arg(dst_host)
-                    .arg(format!("rm -f {}", shell_quote(dst_remote)))
+                    .arg(format!("rm -f {}", shell_quote(&dst_remote)))
                     .status();
                 errors.push(format!(
                     "{}: upload integrity check failed — hash mismatch (source retained, dest copy removed)",
@@ -2580,7 +2958,8 @@ fn run_remote_to_remote_rsync_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }
@@ -2662,7 +3041,7 @@ fn run_remote_rsync_worker(
     host: &str,
     remote_base: &str,
     do_move: bool,
-    overwrite: bool,
+    conflict_mode: ConflictMode,
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
@@ -2713,7 +3092,7 @@ fn run_remote_rsync_worker(
     }
 
     // Collect files locally
-    let (files, excluded) = match collect_files(&source, patterns) {
+    let (files, excluded_files, excluded_dirs) = match collect_files(&source, patterns) {
         Ok(v) => v,
         Err(e) => {
             let _ = tx.send(WorkerMsg::Error(e));
@@ -2726,7 +3105,8 @@ fn run_remote_rsync_worker(
         let _ = tx.send(WorkerMsg::Finished {
             copied: 0,
             skipped: vec![],
-            excluded,
+            excluded_files,
+            excluded_dirs,
             errors: vec![],
         });
         return;
@@ -2798,8 +3178,8 @@ fn run_remote_rsync_worker(
         }
     }
 
-    // If !overwrite, get list of existing remote files in one SSH call
-    let existing: HashSet<String> = if !overwrite {
+    // If not overwriting, get list of existing remote files in one SSH call
+    let existing: HashSet<String> = if conflict_mode != ConflictMode::Overwrite {
         let out = Command::new("ssh")
             .args(&ctl)
             .arg(host)
@@ -2825,19 +3205,29 @@ fn run_remote_rsync_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (local, remote)) in transfers.iter().enumerate() {
-        // Skip if file exists remotely and overwrite is off
-        if !overwrite && existing.contains(remote) {
-            skipped.push(format!(
-                "{}: already exists at destination",
-                local.display()
-            ));
-            let _ = tx.send(WorkerMsg::Progress {
-                done: i + 1,
-                total: total_transfers,
-                file: local.to_string_lossy().to_string(),
-            });
-            continue;
-        }
+        // Handle conflict if file exists remotely
+        let remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(remote) {
+            match conflict_mode {
+                ConflictMode::Skip => {
+                    skipped.push(format!(
+                        "{}: already exists at destination",
+                        local.display()
+                    ));
+                    let _ = tx.send(WorkerMsg::Progress {
+                        done: i + 1,
+                        total: total_transfers,
+                        file: local.to_string_lossy().to_string(),
+                    });
+                    continue;
+                }
+                ConflictMode::Rename => {
+                    std::borrow::Cow::Owned(find_unique_remote_path_from_set(remote, &existing))
+                }
+                ConflictMode::Overwrite => unreachable!(),
+            }
+        } else {
+            std::borrow::Cow::Borrowed(remote.as_str())
+        };
 
         // Transfer via rsync with checksum verification
         let rsync_result = Command::new("rsync")
@@ -2853,7 +3243,7 @@ fn run_remote_rsync_worker(
                 // rsync --checksum already verifies integrity during transfer,
                 // but we perform an additional SHA-256 comparison to be safe,
                 // especially before deleting source files in move mode.
-                match verify_remote_hash(local, host, &ctl, remote) {
+                match verify_remote_hash(local, host, &ctl, &remote) {
                     Ok(true) => {
                         copied += 1;
                         if do_move {
@@ -2871,7 +3261,7 @@ fn run_remote_rsync_worker(
                         let _ = Command::new("ssh")
                             .args(&ctl)
                             .arg(host)
-                            .arg(format!("rm -f {}", shell_quote(remote)))
+                            .arg(format!("rm -f {}", shell_quote(&remote)))
                             .status();
                         errors.push(format!(
                             "{}: integrity check failed — hash mismatch (original retained, remote copy removed)",
@@ -2918,7 +3308,8 @@ fn run_remote_rsync_worker(
     let _ = tx.send(WorkerMsg::Finished {
         copied,
         skipped,
-        excluded,
+        excluded_files,
+        excluded_dirs,
         errors,
     });
 }

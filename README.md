@@ -188,6 +188,90 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 | `host:/path` | Local path | Download via SCP or rsync with SHA-256 verification |
 | `host1:/path` | `host2:/path` | Download to local temp → verify → upload to dest → verify → clean up |
 
+## Test Suite
+
+Kosmokopy includes an external Python test suite that exercises the real Rust binary via its `--cli` headless mode, then verifies results in Python.
+
+### What It Tests
+
+| Test file | What it covers |
+|-----------|---------------|
+| `test_local.py` | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation |
+| `test_conflicts.py` | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `_1`, `_2`, … auto-rename numbering scheme |
+| `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching |
+| `test_integrity.py` | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity |
+| `test_remote.py` | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, real source directory upload |
+
+### How It Works
+
+Every test invokes `kosmokopy --cli` (the headless mode) via Python's `subprocess` module. The binary performs the actual file operation and prints a JSON result. Python then inspects the destination filesystem (or remote host via SSH) to verify correctness — file existence, hash match, source deletion (for moves), and correct error handling.
+
+Remote tests use real SSH connections and are automatically **skipped** when the remote host environment variables are not set.
+
+### CLI Mode
+
+The `--cli` flag runs the application headlessly (no GTK window). It accepts the same options as the GUI but as command-line arguments:
+
+```
+kosmokopy --cli --src <dir> --dst <dir> [options]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--src <path>` | Source directory |
+| `--dst <path>` | Destination directory (local or `host:/path`) |
+| `--src-files <a,b,c>` | Comma-separated list of individual source files |
+| `--move` | Move instead of copy |
+| `--conflict <skip\|overwrite\|rename>` | Conflict resolution strategy (default: `skip`) |
+| `--strip-spaces` | Replace spaces with underscores in destination filenames |
+| `--mode <files\|folders>` | Transfer mode (default: `folders`) |
+| `--method <standard\|rsync>` | Transfer method (default: `standard`) |
+| `--exclude <pattern>` | Exclusion pattern (repeatable) |
+
+Output is a single JSON line:
+```json
+{"status":"finished","copied":3,"skipped":[],"excluded":0,"errors":[]}
+```
+
+### Running the Tests
+
+**Prerequisites:** Python 3.9+, pipenv, pytest
+
+```bash
+# Install test dependencies (one-time)
+pipenv install --dev pytest
+
+# Run all local tests
+pipenv run python -m pytest tests/ -v
+
+# Run a specific test file
+pipenv run python -m pytest tests/test_integrity.py -v
+
+# Run a specific test class
+pipenv run python -m pytest tests/test_exclusions.py::TestWildcardMatching -v
+```
+
+### Enabling Remote Tests
+
+Remote tests require SSH access to one or two hosts listed in `~/.ssh/config`. Set the following environment variables before running:
+
+```bash
+# Single remote host (local↔remote tests)
+export KOSMOKOPY_TEST_REMOTE_HOST="myserver"          # or "user@myserver"
+export KOSMOKOPY_TEST_REMOTE_PATH="/tmp/kosmokopy_test"
+
+# Second remote host (remote→remote relay tests)
+export KOSMOKOPY_TEST_REMOTE_HOST2="otherserver"
+export KOSMOKOPY_TEST_REMOTE_PATH2="/tmp/kosmokopy_test2"
+
+# Optional: real source directory (uploads first 10 files and verifies hashes)
+export KOSMOKOPY_TEST_SOURCE_DIR="/path/to/real/files"
+
+pipenv run python -m pytest tests/ -v
+```
+
+Remote test directories are created automatically and cleaned up after each test.
+
 ## Author
 
 **Dan Bright** — [dan@danbright.uk](mailto:dan@danbright.uk)
@@ -204,8 +288,16 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 ## Changelog
 
+### 2026-02-20
+
+- **Added `--cli` headless mode** — run all transfer operations from the command line without opening a GTK window; accepts `--src`, `--dst`, `--move`, `--conflict`, `--strip-spaces`, `--mode`, `--method`, `--exclude` and prints a JSON result
+- **Rewrote test suite to use the real binary** — all 76 tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
+
 ### 2026-02-19
 
+- **Added conflict mode selection** — new `ConflictMode` enum (Skip / Overwrite / Rename) replaces the boolean overwrite toggle; radio buttons in the UI let users choose how filename collisions are handled
+- **Auto-rename on conflict** — when Rename mode is selected, conflicting files are saved as `file (1).ext`, `file (2).ext`, etc.; works for both local and remote destinations
+- **Added external Python test suite** — 104 tests across 5 files (`test_local`, `test_conflicts`, `test_exclusions`, `test_integrity`, `test_remote`) covering local/remote copy and move, all conflict modes, wildcard exclusions, SHA-256 verification, corruption detection, and remote-to-remote relay; remote tests auto-skip when environment variables are unset
 - **Added remote source support** — new "Remote source" text entry field accepts `host:/path` to pull files from a remote machine; overrides local source selection when filled in
 - **Added remote-to-local transfers** — download files from a remote host to a local destination with SHA-256 hash verification; supports both SCP and rsync methods
 - **Added remote-to-remote transfers** — transfer files between two remote hosts using the local machine as a secure relay; files are downloaded, verified, uploaded, and verified again before source deletion (move mode)
