@@ -166,6 +166,18 @@ fn build_ui(app: &Application) {
     excl_btn_row.append(&btn_excl_clear);
     root.append(&excl_btn_row);
 
+    // Manual pattern entry row
+    let pattern_row = GtkBox::new(Orientation::Horizontal, 8);
+    let pattern_entry = Entry::new();
+    pattern_entry.set_hexpand(true);
+    pattern_entry.set_placeholder_text(Some("Pattern (e.g. *.jpg, /tmp*, test_*)"));
+    let btn_add_file_pattern = Button::with_label("+ File Pattern");
+    let btn_add_dir_pattern = Button::with_label("+ Dir Pattern");
+    pattern_row.append(&pattern_entry);
+    pattern_row.append(&btn_add_file_pattern);
+    pattern_row.append(&btn_add_dir_pattern);
+    root.append(&pattern_row);
+
     let excl_view = TextView::new();
     excl_view.set_editable(false);
     excl_view.set_cursor_visible(false);
@@ -179,7 +191,8 @@ fn build_ui(app: &Application) {
         .build();
     root.append(&excl_scroll);
 
-    // Shared exclusion state: dirs stored as "/dirname", files as "filename"
+    // Shared exclusion state: dirs stored as "/dirname", files as "filename",
+    // wildcard dir patterns as "~/pattern", wildcard file patterns as "~pattern"
     let exclusions: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
 
     // ── Overwrite toggle ─────────────────────────────────────────────
@@ -382,6 +395,47 @@ fn build_ui(app: &Application) {
         btn_excl_clear.connect_clicked(move |_| {
             excls.borrow_mut().clear();
             view.buffer().set_text("");
+        });
+    }
+
+    // ── Manual pattern buttons ────────────────────────────────────────
+    {
+        let excls = exclusions.clone();
+        let view = excl_view.clone();
+        let entry = pattern_entry.clone();
+        btn_add_file_pattern.connect_clicked(move |_| {
+            let text = entry.text().to_string().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            // File wildcard pattern stored as "~pattern"
+            let pattern = format!("~{}", text);
+            let mut list = excls.borrow_mut();
+            if !list.contains(&pattern) {
+                list.push(pattern);
+            }
+            refresh_exclusion_view(&view, &list);
+            entry.set_text("");
+        });
+    }
+
+    {
+        let excls = exclusions.clone();
+        let view = excl_view.clone();
+        let entry = pattern_entry.clone();
+        btn_add_dir_pattern.connect_clicked(move |_| {
+            let text = entry.text().to_string().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            // Dir wildcard pattern stored as "~/pattern"
+            let pattern = format!("~/{}", text);
+            let mut list = excls.borrow_mut();
+            if !list.contains(&pattern) {
+                list.push(pattern);
+            }
+            refresh_exclusion_view(&view, &list);
+            entry.set_text("");
         });
     }
 
@@ -673,7 +727,13 @@ fn refresh_exclusion_view(view: &TextView, items: &[String]) {
     let display: Vec<String> = items
         .iter()
         .map(|item| {
-            if item.starts_with('/') {
+            if item.starts_with("~/") {
+                // Wildcard directory pattern
+                format!("{}/ (dir pattern)", &item[1..])
+            } else if item.starts_with('~') {
+                // Wildcard file pattern
+                format!("{} (file pattern)", &item[1..])
+            } else if item.starts_with('/') {
                 format!("{}/ (recursive)", item)
             } else {
                 item.clone()
@@ -720,6 +780,31 @@ fn strip_spaces_from_path(base: &Path, full: &Path) -> PathBuf {
     }
 }
 
+// ── Wildcard pattern matching ──────────────────────────────────────────
+
+/// Match a name against a pattern that may contain `*` (any chars) and `?`
+/// (single char) wildcards.  Matching is case-insensitive and only ever
+/// applied to a single path component (file or directory name).
+fn wildcard_matches(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    wildcard_match_inner(&p, &n)
+}
+
+fn wildcard_match_inner(pattern: &[char], name: &[char]) -> bool {
+    match (pattern.first(), name.first()) {
+        (None, None) => true,
+        (Some('*'), _) => {
+            // '*' matches zero or more characters
+            wildcard_match_inner(&pattern[1..], name)
+                || (!name.is_empty() && wildcard_match_inner(pattern, &name[1..]))
+        }
+        (Some('?'), Some(_)) => wildcard_match_inner(&pattern[1..], &name[1..]),
+        (Some(pc), Some(nc)) if *pc == *nc => wildcard_match_inner(&pattern[1..], &name[1..]),
+        _ => false,
+    }
+}
+
 // ── File collection (shared by local & remote workers) ─────────────────
 
 fn collect_files(
@@ -730,15 +815,29 @@ fn collect_files(
         SourceSelection::None => Err("No source selected.".to_string()),
         SourceSelection::Files(paths) => Ok((paths.clone(), 0)),
         SourceSelection::Directory(src_dir) => {
+            // Exact directory exclusions: "/dirname"
             let excluded_dirs: HashSet<String> = patterns
                 .iter()
-                .filter(|p| p.starts_with('/'))
+                .filter(|p| p.starts_with('/') && !p.starts_with("~/"))
                 .map(|p| p.trim_start_matches('/').to_string())
                 .collect();
+            // Exact file exclusions: "filename"
             let excluded_files: HashSet<String> = patterns
                 .iter()
-                .filter(|p| !p.starts_with('/'))
+                .filter(|p| !p.starts_with('/') && !p.starts_with('~'))
                 .cloned()
+                .collect();
+            // Wildcard directory patterns: "~/pattern" → "pattern"
+            let wildcard_dirs: Vec<String> = patterns
+                .iter()
+                .filter(|p| p.starts_with("~/"))
+                .map(|p| p[2..].to_string())
+                .collect();
+            // Wildcard file patterns: "~pattern" (but not "~/...")
+            let wildcard_files: Vec<String> = patterns
+                .iter()
+                .filter(|p| p.starts_with('~') && !p.starts_with("~/"))
+                .map(|p| p[1..].to_string())
                 .collect();
 
             let src_dir = src_dir.clone();
@@ -750,14 +849,22 @@ fn collect_files(
                 }
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy().to_string();
-                    return !excluded_dirs.contains(&name);
+                    if excluded_dirs.contains(&name) {
+                        return false;
+                    }
+                    if wildcard_dirs.iter().any(|pat| wildcard_matches(pat, &name)) {
+                        return false;
+                    }
+                    return true;
                 }
                 true
             }) {
                 match entry {
                     Ok(e) if e.file_type().is_file() => {
                         let name = e.file_name().to_string_lossy().to_string();
-                        if excluded_files.contains(&name) {
+                        if excluded_files.contains(&name)
+                            || wildcard_files.iter().any(|pat| wildcard_matches(pat, &name))
+                        {
                             excluded_count += 1;
                         } else {
                             collected.push(e.into_path());
