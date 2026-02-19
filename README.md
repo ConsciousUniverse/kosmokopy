@@ -14,8 +14,9 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 ### Source Selection
 
-- **Browse Folder** — select a directory and recursively process all files within it
-- **Browse Files** — pick individual files for transfer
+- **Browse Folder** — select a local directory and recursively process all files within it
+- **Browse Files** — pick individual local files for transfer
+- **Remote source** — type `host:/remote/path` in the "Remote source" field to pull files from a remote machine (overrides local source selection when filled in)
 
 ### Transfer Modes
 
@@ -37,8 +38,12 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 - **Exclude Directories** — pick directories to skip (all contents are excluded recursively)
 - **Exclude Files** — pick individual filenames to skip wherever they appear
+- **+ File Pattern** — manually enter a wildcard pattern to exclude matching filenames (e.g. `*.jpg`, `test_*`)
+- **+ Dir Pattern** — manually enter a wildcard pattern to exclude matching directory names (e.g. `tmp*`, `.git*`)
 - **Clear** — remove all exclusion rules
 - Exclusions are displayed in a read-only scrollable list
+
+**Wildcard patterns** support `*` (matches zero or more characters) and `?` (matches exactly one character). Matching is case-insensitive and applies to the file or directory **name** only (not the full path). For example, `te*` will match a file named `test.jpg` regardless of where it sits in the directory tree, but will not match a file inside a directory called `test/`.
 
 ### Overwrite Handling
 
@@ -70,15 +75,33 @@ Kosmokopy compares source and destination files byte-by-byte before deciding wha
 
 ### SSH Remote Transfers
 
-Transfer files to remote machines using SSH config hosts:
+Transfer files to or from remote machines, or between two remote machines, using SSH config hosts:
+
+**Local → Remote:**
 
 - Type `hostname:/remote/path` in the destination field (e.g. `ubuntu:/home/dan/backup`)
-- The hostname must match an entry in `~/.ssh/config`
+
+**Remote → Local:**
+
+- Type `hostname:/remote/path` in the "Remote source" field
+- Set a local destination folder
+
+**Remote → Remote:**
+
+- Type `source_host:/path` in the "Remote source" field
+- Type `dest_host:/path` in the destination field
+- Files are relayed through the local machine: downloaded from source, verified, uploaded to destination, verified again
+- The local machine acts as a secure intermediary — files are staged in a temporary directory that is cleaned up after transfer
+
+**Common remote features:**
+
+- Hostnames must match entries in `~/.ssh/config`
 - Uses SSH connection multiplexing for performance
 - Creates remote directories automatically
 - Remote overwrite detection checks existing files before transfer
 - Post-transfer SHA-256 hash verification ensures data integrity
-- For moves, local files are deleted only after hash verification passes
+- Source files are deleted only after hash verification passes (move mode)
+- Both Standard (scp) and rsync methods are supported for all remote transfer directions
 
 ### Progress and Reporting
 
@@ -145,13 +168,25 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 
 ## Usage
 
-1. **Select source** — click "Browse Folder" for a directory or "Browse Files" for individual files
-2. **Set destination** — browse for a local folder, type a path, or enter `host:/path` for remote
+1. **Select source** — choose one of:
+   - Click "Browse Folder" for a local directory
+   - Click "Browse Files" for individual local files
+   - Type `host:/remote/path` in the "Remote source" field for a remote source
+2. **Set destination** — browse for a local folder, type a local path, or enter `host:/path` for a remote destination
 3. **Choose mode** — Copy or Move, Files Only or Folders and Files
 4. **Choose transfer method** — Standard (cp/scp) or rsync
-5. **Set exclusions** (optional) — use the Exclude Directories / Exclude Files buttons
+5. **Set exclusions** (optional) — use the picker buttons or type wildcard patterns (e.g. `*.log`, `tmp*`) and click "+ File Pattern" or "+ Dir Pattern"
 6. **Toggle overwrite** (optional) — check "Overwrite existing files" to replace differing files
 7. **Click Transfer**
+
+### Transfer Scenarios
+
+| Source | Destination | How it works |
+|--------|-------------|-------------|
+| Local folder/files | Local path | Direct file copy/move with byte-by-byte verification |
+| Local folder/files | `host:/path` | Upload via SCP or rsync with SHA-256 verification |
+| `host:/path` | Local path | Download via SCP or rsync with SHA-256 verification |
+| `host1:/path` | `host2:/path` | Download to local temp → verify → upload to dest → verify → clean up |
 
 ## Author
 
@@ -171,6 +206,10 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 ### 2026-02-19
 
+- **Added remote source support** — new "Remote source" text entry field accepts `host:/path` to pull files from a remote machine; overrides local source selection when filled in
+- **Added remote-to-local transfers** — download files from a remote host to a local destination with SHA-256 hash verification; supports both SCP and rsync methods
+- **Added remote-to-remote transfers** — transfer files between two remote hosts using the local machine as a secure relay; files are downloaded, verified, uploaded, and verified again before source deletion (move mode)
+- **Added wildcard exclusion patterns** — new "+ File Pattern" and "+ Dir Pattern" buttons allow manual entry of `*` and `?` wildcard patterns for flexible exclusion matching
 - **Added rsync transfer method** — available for both local and remote transfers via a new "Transfer method" radio button group (Standard / rsync)
 - **Added SHA-256 hash verification for remote transfers** — both SCP and rsync remote transfers now verify integrity by comparing local and remote SHA-256 hashes after each file transfer
 - **Hardened SCP remote move safety** — source files are no longer deleted after SCP transfer without cryptographic hash verification; previously relied solely on SCP exit status

@@ -35,6 +35,7 @@ enum SourceSelection {
     None,
     Directory(PathBuf),
     Files(Vec<PathBuf>),
+    Remote(String, String), // (host, remote_path)
 }
 
 // ── Transfer mode ──────────────────────────────────────────────────────
@@ -111,6 +112,18 @@ fn build_ui(app: &Application) {
     src_row.append(&btn_browse_folder);
     src_row.append(&btn_browse_files);
     root.append(&src_row);
+
+    // Remote source entry
+    let src_remote_row = GtkBox::new(Orientation::Horizontal, 8);
+    let src_remote_label = Label::new(Some("Remote source:"));
+    src_remote_label.set_width_chars(14);
+    src_remote_label.set_halign(Align::Start);
+    let src_remote_entry = Entry::new();
+    src_remote_entry.set_hexpand(true);
+    src_remote_entry.set_placeholder_text(Some("host:/remote/path (overrides local source)"));
+    src_remote_row.append(&src_remote_label);
+    src_remote_row.append(&src_remote_entry);
+    root.append(&src_remote_row);
 
     // ── Destination directory ─────────────────────────────────────────
     let dst_row = dir_row_editable("Destination Directory:");
@@ -450,6 +463,7 @@ fn build_ui(app: &Application) {
         let chk_overwrite = chk_overwrite.clone();
         let chk_strip_spaces = chk_strip_spaces.clone();
         let chk_rsync = chk_rsync.clone();
+        let src_remote_entry = src_remote_entry.clone();
         let exclusions = exclusions.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
@@ -464,10 +478,25 @@ fn build_ui(app: &Application) {
 
             let source_sel = source_selection.borrow().clone();
             let dst = dst_entry.text().to_string();
+            let remote_src_text = src_remote_entry.text().to_string().trim().to_string();
+
+            // If a remote source is specified, it overrides local source selection
+            let source_sel = if !remote_src_text.is_empty() {
+                let (rhost, rpath) = parse_destination(&remote_src_text);
+                match rhost {
+                    Some(host) => SourceSelection::Remote(host, rpath),
+                    None => {
+                        status_label.set_text("Remote source must be in host:/path format.");
+                        return;
+                    }
+                }
+            } else {
+                source_sel
+            };
 
             match &source_sel {
                 SourceSelection::None => {
-                    status_label.set_text("Please select a source (folder or files).");
+                    status_label.set_text("Please select a source (folder, files, or remote).");
                     return;
                 }
                 SourceSelection::Directory(p) if p.to_string_lossy() == dst => {
@@ -510,21 +539,50 @@ fn build_ui(app: &Application) {
             // Spawn worker thread
             let dst_clone = dst.clone();
             thread::spawn(move || {
-                let (remote_host, dest_path) = parse_destination(&dst_clone);
-                match (remote_host, transfer_method) {
-                    (Some(host), TransferMethod::Standard) => run_remote_worker(
+                let (dst_host, dest_path) = parse_destination(&dst_clone);
+                let src_is_remote = matches!(&source_sel, SourceSelection::Remote(_, _));
+                match (src_is_remote, dst_host, transfer_method) {
+                    // Remote source → remote destination
+                    (true, Some(dhost), TransferMethod::Standard) => {
+                        if let SourceSelection::Remote(shost, spath) = &source_sel {
+                            run_remote_to_remote_worker(
+                                shost, &spath, &dhost, &dest_path, do_move, overwrite,
+                                strip_spaces, transfer_mode, &patterns, tx,
+                            );
+                        }
+                    }
+                    (true, Some(dhost), TransferMethod::Rsync) => {
+                        if let SourceSelection::Remote(shost, spath) = &source_sel {
+                            run_remote_to_remote_rsync_worker(
+                                shost, &spath, &dhost, &dest_path, do_move, overwrite,
+                                strip_spaces, transfer_mode, &patterns, tx,
+                            );
+                        }
+                    }
+                    // Remote source → local destination
+                    (true, None, transfer_method) => {
+                        if let SourceSelection::Remote(shost, spath) = &source_sel {
+                            run_remote_to_local_worker(
+                                shost, &spath, &dest_path, do_move, overwrite,
+                                strip_spaces, transfer_mode, &patterns, transfer_method, tx,
+                            );
+                        }
+                    }
+                    // Local source → remote destination
+                    (false, Some(host), TransferMethod::Standard) => run_remote_worker(
                         source_sel, &host, &dest_path, do_move, overwrite,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
-                    (Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
+                    (false, Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
                         source_sel, &host, &dest_path, do_move, overwrite,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
-                    (None, TransferMethod::Rsync) => run_local_rsync_worker(
+                    // Local source → local destination
+                    (false, None, TransferMethod::Rsync) => run_local_rsync_worker(
                         source_sel, dest_path, do_move, overwrite,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
-                    (None, TransferMethod::Standard) => run_worker(
+                    (false, None, TransferMethod::Standard) => run_worker(
                         source_sel, dest_path, do_move, overwrite,
                         strip_spaces, transfer_mode, &patterns, tx,
                     ),
@@ -813,6 +871,7 @@ fn collect_files(
 ) -> Result<(Vec<PathBuf>, usize), String> {
     match source {
         SourceSelection::None => Err("No source selected.".to_string()),
+        SourceSelection::Remote(_, _) => Err("Remote source uses its own file listing.".to_string()),
         SourceSelection::Files(paths) => Ok((paths.clone(), 0)),
         SourceSelection::Directory(src_dir) => {
             // Exact directory exclusions: "/dirname"
@@ -1596,6 +1655,941 @@ fn files_are_identical(a: &Path, b: &Path) -> std::io::Result<bool> {
             return Ok(true);
         }
     }
+}
+
+// ── Remote file listing ────────────────────────────────────────────────
+
+/// List files on a remote host under `remote_base`, applying exclusion patterns.
+/// Returns (Vec<remote_path>, excluded_count).
+fn collect_remote_files(
+    host: &str,
+    ctl: &[&str],
+    remote_base: &str,
+    patterns: &[String],
+) -> Result<(Vec<String>, usize), String> {
+    let out = Command::new("ssh")
+        .args(ctl)
+        .arg(host)
+        .arg(format!("find {} -type f 2>/dev/null", shell_quote(remote_base)))
+        .output()
+        .map_err(|e| format!("Failed to list remote files: {}", e))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "Failed to list remote files: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    // Parse exclusion patterns
+    let excluded_dirs: HashSet<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with('/') && !p.starts_with("~/"))
+        .map(|p| p.trim_start_matches('/').to_string())
+        .collect();
+    let excluded_files: HashSet<String> = patterns
+        .iter()
+        .filter(|p| !p.starts_with('/') && !p.starts_with('~'))
+        .cloned()
+        .collect();
+    let wildcard_dirs: Vec<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with("~/"))
+        .map(|p| p[2..].to_string())
+        .collect();
+    let wildcard_files: Vec<String> = patterns
+        .iter()
+        .filter(|p| p.starts_with('~') && !p.starts_with("~/"))
+        .map(|p| p[1..].to_string())
+        .collect();
+
+    let remote_base_slash = format!("{}/", remote_base.trim_end_matches('/'));
+    let mut collected = Vec::new();
+    let mut excluded_count = 0usize;
+
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Get relative path from remote_base
+        let rel = if let Some(stripped) = line.strip_prefix(&remote_base_slash) {
+            stripped
+        } else if line == remote_base {
+            continue;
+        } else {
+            continue;
+        };
+
+        // Check directory exclusions against each path component
+        let parts: Vec<&str> = rel.split('/').collect();
+        let filename = parts.last().unwrap_or(&"");
+
+        // Check dir exclusions (all components except the filename)
+        let mut dir_excluded = false;
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            if excluded_dirs.contains(*part)
+                || wildcard_dirs.iter().any(|pat| wildcard_matches(pat, part))
+            {
+                dir_excluded = true;
+                break;
+            }
+        }
+        if dir_excluded {
+            excluded_count += 1;
+            continue;
+        }
+
+        // Check file exclusions
+        if excluded_files.contains(*filename)
+            || wildcard_files.iter().any(|pat| wildcard_matches(pat, filename))
+        {
+            excluded_count += 1;
+            continue;
+        }
+
+        collected.push(line.to_string());
+    }
+
+    Ok((collected, excluded_count))
+}
+
+// ── Worker thread (remote source → local destination) ──────────────────
+
+fn run_remote_to_local_worker(
+    src_host: &str,
+    src_remote_base: &str,
+    local_dst: &str,
+    do_move: bool,
+    overwrite: bool,
+    strip_spaces: bool,
+    transfer_mode: TransferMode,
+    patterns: &[String],
+    transfer_method: TransferMethod,
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let ctl = [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+        "-o", "ControlPersist=60",
+    ];
+
+    // Connectivity check to source
+    let check = Command::new("ssh")
+        .args(&ctl)
+        .args([src_host, "echo ok"])
+        .output();
+    match check {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "SSH connection to source '{}' failed: {}",
+                src_host,
+                String::from_utf8_lossy(&o.stderr).trim()
+            )));
+            return;
+        }
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!("Could not run ssh: {}", e)));
+            return;
+        }
+    }
+
+    // List remote source files
+    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            return;
+        }
+    };
+
+    let total = remote_files.len();
+    if total == 0 {
+        let _ = tx.send(WorkerMsg::Finished {
+            copied: 0,
+            skipped: vec![],
+            excluded,
+            errors: vec![],
+        });
+        return;
+    }
+
+    let dst_path = PathBuf::from(local_dst);
+    if !dst_path.exists() {
+        if let Err(e) = fs::create_dir_all(&dst_path) {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create destination directory: {}", e
+            )));
+            return;
+        }
+    }
+
+    let src_base = src_remote_base.trim_end_matches('/');
+    let src_base_slash = format!("{}/", src_base);
+    let ssh_cmd = "ssh -o ControlMaster=auto -o ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r -o ControlPersist=60";
+
+    let mut copied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, remote_file) in remote_files.iter().enumerate() {
+        let rel = remote_file
+            .strip_prefix(&src_base_slash)
+            .unwrap_or(remote_file);
+
+        let local_dest = match transfer_mode {
+            TransferMode::FoldersAndFiles => dst_path.join(rel),
+            TransferMode::FilesOnly => {
+                let fname = Path::new(rel)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.to_string());
+                dst_path.join(fname)
+            }
+        };
+
+        let local_dest = if strip_spaces {
+            strip_spaces_from_path(&dst_path, &local_dest)
+        } else {
+            local_dest
+        };
+
+        // Create parent directory
+        if let Some(parent) = local_dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("{}: {}", remote_file, e));
+                continue;
+            }
+        }
+
+        // Check overwrite
+        if local_dest.exists() && !overwrite {
+            skipped.push(format!("{}: already exists at destination", remote_file));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total,
+                file: remote_file.clone(),
+            });
+            continue;
+        }
+
+        // Download from source
+        let download_ok = match transfer_method {
+            TransferMethod::Standard => {
+                let result = Command::new("scp")
+                    .args(&ctl)
+                    .arg("-q")
+                    .arg(format!("{}:{}", src_host, remote_file))
+                    .arg(&local_dest)
+                    .status();
+                matches!(result, Ok(s) if s.success())
+            }
+            TransferMethod::Rsync => {
+                let result = Command::new("rsync")
+                    .args(["-az", "--checksum"])
+                    .arg("-e")
+                    .arg(ssh_cmd)
+                    .arg(format!("{}:{}", src_host, remote_file))
+                    .arg(&local_dest)
+                    .status();
+                matches!(result, Ok(s) if s.success())
+            }
+        };
+
+        if !download_ok {
+            errors.push(format!("{}: download from source failed", remote_file));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total,
+                file: remote_file.clone(),
+            });
+            continue;
+        }
+
+        // Verify download with SHA-256
+        match verify_remote_hash(&local_dest, src_host, &ctl, remote_file) {
+            Ok(true) => {
+                copied += 1;
+                if do_move {
+                    // Delete from source host
+                    let rm_result = Command::new("ssh")
+                        .args(&ctl)
+                        .arg(src_host)
+                        .arg(format!("rm -f {}", shell_quote(remote_file)))
+                        .status();
+                    if !matches!(rm_result, Ok(s) if s.success()) {
+                        errors.push(format!(
+                            "{}: downloaded and verified but failed to delete from source",
+                            remote_file
+                        ));
+                    }
+                }
+            }
+            Ok(false) => {
+                let _ = fs::remove_file(&local_dest);
+                errors.push(format!(
+                    "{}: download integrity check failed — hash mismatch (local copy removed)",
+                    remote_file
+                ));
+            }
+            Err(e) => {
+                if do_move {
+                    errors.push(format!(
+                        "{}: downloaded but verification failed: {} (source retained)",
+                        remote_file, e
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{}: downloaded but could not verify: {}",
+                        remote_file, e
+                    ));
+                }
+            }
+        }
+
+        let _ = tx.send(WorkerMsg::Progress {
+            done: i + 1,
+            total,
+            file: remote_file.clone(),
+        });
+    }
+
+    let _ = tx.send(WorkerMsg::Finished {
+        copied,
+        skipped,
+        excluded,
+        errors,
+    });
+}
+
+// ── Worker thread (remote source → remote destination via SCP) ─────────
+
+fn run_remote_to_remote_worker(
+    src_host: &str,
+    src_remote_base: &str,
+    dst_host: &str,
+    dst_remote_base: &str,
+    do_move: bool,
+    overwrite: bool,
+    strip_spaces: bool,
+    transfer_mode: TransferMode,
+    patterns: &[String],
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let ctl = [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+        "-o", "ControlPersist=60",
+    ];
+
+    // Connectivity check to both hosts
+    for host in [src_host, dst_host] {
+        let check = Command::new("ssh")
+            .args(&ctl)
+            .args([host, "echo ok"])
+            .output();
+        match check {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tx.send(WorkerMsg::Error(format!(
+                    "SSH connection to '{}' failed: {}",
+                    host,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )));
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(format!("Could not run ssh: {}", e)));
+                return;
+            }
+        }
+    }
+
+    // List remote source files
+    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            return;
+        }
+    };
+
+    let total = remote_files.len();
+    if total == 0 {
+        let _ = tx.send(WorkerMsg::Finished {
+            copied: 0,
+            skipped: vec![],
+            excluded,
+            errors: vec![],
+        });
+        return;
+    }
+
+    // Create a temp directory for the local staging area
+    let temp_dir = match tempdir_for_relay() {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create temp directory: {}", e
+            )));
+            return;
+        }
+    };
+
+    let src_base = src_remote_base.trim_end_matches('/');
+    let src_base_slash = format!("{}/", src_base);
+    let dst_base = dst_remote_base.trim_end_matches('/');
+
+    // Build destination remote paths and ensure remote dirs
+    let mut transfers: Vec<(String, String, PathBuf)> = Vec::new(); // (src_remote, dst_remote, local_temp)
+    let mut dst_remote_dirs: HashSet<String> = HashSet::new();
+    dst_remote_dirs.insert(dst_base.to_string());
+
+    for remote_file in &remote_files {
+        let rel = remote_file
+            .strip_prefix(&src_base_slash)
+            .unwrap_or(remote_file);
+
+        let dst_rel = match transfer_mode {
+            TransferMode::FoldersAndFiles => rel.to_string(),
+            TransferMode::FilesOnly => {
+                Path::new(rel)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.to_string())
+            }
+        };
+
+        let dst_remote = format!("{}/{}", dst_base, dst_rel);
+        let dst_remote = if strip_spaces {
+            dst_remote.split('/').map(|c| c.replace(' ', "")).collect::<Vec<_>>().join("/")
+        } else {
+            dst_remote
+        };
+
+        if let Some(parent) = Path::new(&dst_remote).parent() {
+            dst_remote_dirs.insert(parent.to_string_lossy().to_string());
+        }
+
+        // Local temp path preserves structure for staging
+        let local_temp = temp_dir.join(rel);
+        transfers.push((remote_file.clone(), dst_remote, local_temp));
+    }
+
+    // Create all destination remote directories
+    let dirs_arg: Vec<String> = dst_remote_dirs.iter().map(|d| shell_quote(d)).collect();
+    let mkdir_result = Command::new("ssh")
+        .args(&ctl)
+        .arg(dst_host)
+        .arg(format!("mkdir -p {}", dirs_arg.join(" ")))
+        .output();
+    if let Ok(o) = &mkdir_result {
+        if !o.status.success() {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create remote directories on destination: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )));
+            let _ = fs::remove_dir_all(&temp_dir);
+            return;
+        }
+    }
+
+    // If !overwrite, get existing files on destination
+    let existing: HashSet<String> = if !overwrite {
+        let out = Command::new("ssh")
+            .args(&ctl)
+            .arg(dst_host)
+            .arg(format!("find {} -type f 2>/dev/null", shell_quote(dst_base)))
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let total_transfers = transfers.len();
+    let mut copied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
+        // Skip if destination exists and overwrite is off
+        if !overwrite && existing.contains(dst_remote) {
+            skipped.push(format!("{}: already exists at destination", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        // Create local temp parent dir
+        if let Some(parent) = local_temp.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("{}: temp dir error: {}", src_remote, e));
+                continue;
+            }
+        }
+
+        // Step 1: Download from source to local temp
+        let dl_result = Command::new("scp")
+            .args(&ctl)
+            .arg("-q")
+            .arg(format!("{}:{}", src_host, src_remote))
+            .arg(local_temp)
+            .status();
+        if !matches!(dl_result, Ok(s) if s.success()) {
+            errors.push(format!("{}: download from source failed", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        // Verify download
+        match verify_remote_hash(local_temp, src_host, &ctl, src_remote) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(local_temp);
+                errors.push(format!(
+                    "{}: download integrity check failed — hash mismatch",
+                    src_remote
+                ));
+                let _ = tx.send(WorkerMsg::Progress {
+                    done: i + 1,
+                    total: total_transfers,
+                    file: src_remote.clone(),
+                });
+                continue;
+            }
+            Err(e) => {
+                let _ = fs::remove_file(local_temp);
+                errors.push(format!(
+                    "{}: download verification error: {}",
+                    src_remote, e
+                ));
+                let _ = tx.send(WorkerMsg::Progress {
+                    done: i + 1,
+                    total: total_transfers,
+                    file: src_remote.clone(),
+                });
+                continue;
+            }
+        }
+
+        // Step 2: Upload from local temp to destination
+        let ul_result = Command::new("scp")
+            .args(&ctl)
+            .arg("-q")
+            .arg(local_temp)
+            .arg(format!("{}:{}", dst_host, dst_remote))
+            .status();
+        if !matches!(ul_result, Ok(s) if s.success()) {
+            let _ = fs::remove_file(local_temp);
+            errors.push(format!("{}: upload to destination failed", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        // Verify upload
+        match verify_remote_hash(local_temp, dst_host, &ctl, dst_remote) {
+            Ok(true) => {
+                copied += 1;
+                // Clean up local temp
+                let _ = fs::remove_file(local_temp);
+                if do_move {
+                    let rm_result = Command::new("ssh")
+                        .args(&ctl)
+                        .arg(src_host)
+                        .arg(format!("rm -f {}", shell_quote(src_remote)))
+                        .status();
+                    if !matches!(rm_result, Ok(s) if s.success()) {
+                        errors.push(format!(
+                            "{}: transferred and verified but failed to delete from source",
+                            src_remote
+                        ));
+                    }
+                }
+            }
+            Ok(false) => {
+                let _ = fs::remove_file(local_temp);
+                // Remove corrupt destination copy
+                let _ = Command::new("ssh")
+                    .args(&ctl)
+                    .arg(dst_host)
+                    .arg(format!("rm -f {}", shell_quote(dst_remote)))
+                    .status();
+                errors.push(format!(
+                    "{}: upload integrity check failed — hash mismatch (source retained, dest copy removed)",
+                    src_remote
+                ));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(local_temp);
+                if do_move {
+                    errors.push(format!(
+                        "{}: uploaded but verification failed: {} (source retained)",
+                        src_remote, e
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{}: uploaded but could not verify: {}",
+                        src_remote, e
+                    ));
+                }
+            }
+        }
+
+        let _ = tx.send(WorkerMsg::Progress {
+            done: i + 1,
+            total: total_transfers,
+            file: src_remote.clone(),
+        });
+    }
+
+    // Clean up temp directory
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let _ = tx.send(WorkerMsg::Finished {
+        copied,
+        skipped,
+        excluded,
+        errors,
+    });
+}
+
+// ── Worker thread (remote source → remote destination via rsync) ───────
+
+fn run_remote_to_remote_rsync_worker(
+    src_host: &str,
+    src_remote_base: &str,
+    dst_host: &str,
+    dst_remote_base: &str,
+    do_move: bool,
+    overwrite: bool,
+    strip_spaces: bool,
+    transfer_mode: TransferMode,
+    patterns: &[String],
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let ctl = [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+        "-o", "ControlPersist=60",
+    ];
+    let ssh_cmd = "ssh -o ControlMaster=auto -o ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r -o ControlPersist=60";
+
+    // Connectivity check to both hosts
+    for host in [src_host, dst_host] {
+        let check = Command::new("ssh")
+            .args(&ctl)
+            .args([host, "echo ok"])
+            .output();
+        match check {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let _ = tx.send(WorkerMsg::Error(format!(
+                    "SSH connection to '{}' failed: {}",
+                    host,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )));
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(WorkerMsg::Error(format!("Could not run ssh: {}", e)));
+                return;
+            }
+        }
+    }
+
+    // Check rsync availability
+    match Command::new("rsync").arg("--version").output() {
+        Ok(o) if o.status.success() => {}
+        _ => {
+            let _ = tx.send(WorkerMsg::Error(
+                "rsync is not installed or not found in PATH".to_string(),
+            ));
+            return;
+        }
+    }
+
+    // List remote source files
+    let (remote_files, excluded) = match collect_remote_files(src_host, &ctl, src_remote_base, patterns) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(e));
+            return;
+        }
+    };
+
+    let total = remote_files.len();
+    if total == 0 {
+        let _ = tx.send(WorkerMsg::Finished {
+            copied: 0,
+            skipped: vec![],
+            excluded,
+            errors: vec![],
+        });
+        return;
+    }
+
+    let temp_dir = match tempdir_for_relay() {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create temp directory: {}", e
+            )));
+            return;
+        }
+    };
+
+    let src_base = src_remote_base.trim_end_matches('/');
+    let src_base_slash = format!("{}/", src_base);
+    let dst_base = dst_remote_base.trim_end_matches('/');
+
+    let mut transfers: Vec<(String, String, PathBuf)> = Vec::new();
+    let mut dst_remote_dirs: HashSet<String> = HashSet::new();
+    dst_remote_dirs.insert(dst_base.to_string());
+
+    for remote_file in &remote_files {
+        let rel = remote_file
+            .strip_prefix(&src_base_slash)
+            .unwrap_or(remote_file);
+
+        let dst_rel = match transfer_mode {
+            TransferMode::FoldersAndFiles => rel.to_string(),
+            TransferMode::FilesOnly => {
+                Path::new(rel)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| rel.to_string())
+            }
+        };
+
+        let dst_remote = format!("{}/{}", dst_base, dst_rel);
+        let dst_remote = if strip_spaces {
+            dst_remote.split('/').map(|c| c.replace(' ', "")).collect::<Vec<_>>().join("/")
+        } else {
+            dst_remote
+        };
+
+        if let Some(parent) = Path::new(&dst_remote).parent() {
+            dst_remote_dirs.insert(parent.to_string_lossy().to_string());
+        }
+
+        let local_temp = temp_dir.join(rel);
+        transfers.push((remote_file.clone(), dst_remote, local_temp));
+    }
+
+    // Create destination remote directories
+    let dirs_arg: Vec<String> = dst_remote_dirs.iter().map(|d| shell_quote(d)).collect();
+    let mkdir_result = Command::new("ssh")
+        .args(&ctl)
+        .arg(dst_host)
+        .arg(format!("mkdir -p {}", dirs_arg.join(" ")))
+        .output();
+    if let Ok(o) = &mkdir_result {
+        if !o.status.success() {
+            let _ = tx.send(WorkerMsg::Error(format!(
+                "Failed to create remote directories on destination: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )));
+            let _ = fs::remove_dir_all(&temp_dir);
+            return;
+        }
+    }
+
+    let existing: HashSet<String> = if !overwrite {
+        let out = Command::new("ssh")
+            .args(&ctl)
+            .arg(dst_host)
+            .arg(format!("find {} -type f 2>/dev/null", shell_quote(dst_base)))
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    } else {
+        HashSet::new()
+    };
+
+    let total_transfers = transfers.len();
+    let mut copied = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
+        if !overwrite && existing.contains(dst_remote) {
+            skipped.push(format!("{}: already exists at destination", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        if let Some(parent) = local_temp.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("{}: temp dir error: {}", src_remote, e));
+                continue;
+            }
+        }
+
+        // Download from source via rsync
+        let dl_result = Command::new("rsync")
+            .args(["-az", "--checksum"])
+            .arg("-e")
+            .arg(ssh_cmd)
+            .arg(format!("{}:{}", src_host, src_remote))
+            .arg(local_temp)
+            .status();
+        if !matches!(dl_result, Ok(s) if s.success()) {
+            errors.push(format!("{}: rsync download from source failed", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        // Verify download
+        match verify_remote_hash(local_temp, src_host, &ctl, src_remote) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(local_temp);
+                errors.push(format!(
+                    "{}: download integrity check failed — hash mismatch",
+                    src_remote
+                ));
+                let _ = tx.send(WorkerMsg::Progress {
+                    done: i + 1,
+                    total: total_transfers,
+                    file: src_remote.clone(),
+                });
+                continue;
+            }
+            Err(e) => {
+                let _ = fs::remove_file(local_temp);
+                errors.push(format!(
+                    "{}: download verification error: {}",
+                    src_remote, e
+                ));
+                let _ = tx.send(WorkerMsg::Progress {
+                    done: i + 1,
+                    total: total_transfers,
+                    file: src_remote.clone(),
+                });
+                continue;
+            }
+        }
+
+        // Upload to destination via rsync
+        let ul_result = Command::new("rsync")
+            .args(["-az", "--checksum"])
+            .arg("-e")
+            .arg(ssh_cmd)
+            .arg(local_temp)
+            .arg(format!("{}:{}", dst_host, dst_remote))
+            .status();
+        if !matches!(ul_result, Ok(s) if s.success()) {
+            let _ = fs::remove_file(local_temp);
+            errors.push(format!("{}: rsync upload to destination failed", src_remote));
+            let _ = tx.send(WorkerMsg::Progress {
+                done: i + 1,
+                total: total_transfers,
+                file: src_remote.clone(),
+            });
+            continue;
+        }
+
+        // Verify upload
+        match verify_remote_hash(local_temp, dst_host, &ctl, dst_remote) {
+            Ok(true) => {
+                copied += 1;
+                let _ = fs::remove_file(local_temp);
+                if do_move {
+                    let rm_result = Command::new("ssh")
+                        .args(&ctl)
+                        .arg(src_host)
+                        .arg(format!("rm -f {}", shell_quote(src_remote)))
+                        .status();
+                    if !matches!(rm_result, Ok(s) if s.success()) {
+                        errors.push(format!(
+                            "{}: transferred and verified but failed to delete from source",
+                            src_remote
+                        ));
+                    }
+                }
+            }
+            Ok(false) => {
+                let _ = fs::remove_file(local_temp);
+                let _ = Command::new("ssh")
+                    .args(&ctl)
+                    .arg(dst_host)
+                    .arg(format!("rm -f {}", shell_quote(dst_remote)))
+                    .status();
+                errors.push(format!(
+                    "{}: upload integrity check failed — hash mismatch (source retained, dest copy removed)",
+                    src_remote
+                ));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(local_temp);
+                if do_move {
+                    errors.push(format!(
+                        "{}: uploaded but verification failed: {} (source retained)",
+                        src_remote, e
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{}: uploaded but could not verify: {}",
+                        src_remote, e
+                    ));
+                }
+            }
+        }
+
+        let _ = tx.send(WorkerMsg::Progress {
+            done: i + 1,
+            total: total_transfers,
+            file: src_remote.clone(),
+        });
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let _ = tx.send(WorkerMsg::Finished {
+        copied,
+        skipped,
+        excluded,
+        errors,
+    });
+}
+
+/// Create a temporary directory for relay transfers.
+fn tempdir_for_relay() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("kosmokopy_relay_{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 // ── SHA-256 hashing for remote transfer verification ───────────────────
