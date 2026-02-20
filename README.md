@@ -134,7 +134,26 @@ Transfer files to or from remote machines, or between two remote machines, using
 ### Build Dependencies
 
 - Rust toolchain (edition 2021, Cargo 1.70+)
-- GTK4 development libraries
+- GTK4 development libraries (>= 4.10)
+- `pkg-config`
+
+#### Installing the Rust Toolchain
+
+If you don't already have Rust and Cargo installed:
+
+```bash
+# Using wget (recommended on Ubuntu where curl may be a snap with sandbox restrictions)
+wget -qO- https://sh.rustup.rs | sh
+
+# Or using curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Accept the defaults, then restart your shell or run:
+
+```bash
+source "$HOME/.cargo/env"
+```
 
 #### macOS
 
@@ -142,10 +161,12 @@ Transfer files to or from remote machines, or between two remote machines, using
 brew install gtk4
 ```
 
-#### Ubuntu / Debian
+#### Ubuntu / Debian (24.04+)
+
+GTK4 >= 4.10 is required. Ubuntu 24.04 LTS ships GTK4 4.14 and is the recommended build platform. Ubuntu 22.04 ships GTK4 4.6 which is too old.
 
 ```bash
-sudo apt install libgtk-4-dev build-essential
+sudo apt install libgtk-4-dev build-essential pkg-config
 ```
 
 ### Runtime Dependencies
