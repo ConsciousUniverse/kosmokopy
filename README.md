@@ -4,13 +4,13 @@ A GTK4 file copier and mover with filtering, integrity verification, and SSH rem
 
 This application was 'vibe coded' using Claude Opus 4.6.
 
-IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the provided test suite; and in 'production' on my own systems), but file corruption and complete destruction of your data cannot be guaranteed! Test at your own risk!
+IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the provided test suite; and in 'production' on my own systems), but file corruption and complete destruction of your data cannot be guaranteed! TEST AT YOUR OWN RISK!
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue)
 
 ## Screenshot
 
-![1771546472010](image/README/1771546472010.png)
+![1771616159008](image/README/1771616159008.png)
 
 ## Features
 
@@ -19,7 +19,20 @@ IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the p
 - **Source entry field** — type a local path or `host:/remote/path` directly into the source field
 - **Browse Folder** — opens a folder picker; the selected path fills the source field
 - **Browse Files** — opens a file picker for individual files; the selected file path(s) fill the source field
+- **Browse Remote** — opens an interactive SSH file browser for selecting remote source files or destination directories (see below)
 - Typed paths are auto-detected: `host:/path` is treated as a remote source, plain paths as local directories or files
+
+### Remote File Browser
+
+The **Browse Remote** buttons (available on both source and destination rows) open a dialog that lets you visually navigate directories on a remote SSH host:
+
+- **Host field** — enter an SSH host (e.g. `user@hostname` or a `~/.ssh/config` alias) and click **Connect**
+- **Directory listing** — folders and files on the remote host are displayed in a scrollable list; double-click a folder to navigate into it
+- **Path bar** — shows the current remote path; type a path and click **Go** to jump directly, or click **↑ Up** to go to the parent directory
+- **Home directory** — the browser starts at the SSH user's home directory (`~`) rather than the filesystem root, so you can browse immediately without needing root-level permissions
+- **Selection** — click a file or folder to select it, then click **Select** to fill in the source or destination field with `host:/selected/path`
+- For destination browsing, directories are pre-selected (since the destination is always a folder)
+- Uses SSH connection multiplexing for fast, responsive navigation
 
 ### Transfer Modes
 
@@ -178,8 +191,9 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
    - Type a local path directly in the source field
    - Click "Browse Folder" to select a local directory (fills the source field)
    - Click "Browse Files" to pick individual local files
+   - Click "Browse Remote" to visually browse and select files or folders on a remote SSH host
    - Type `host:/remote/path` in the source field for a remote source
-2. **Set destination** — browse for a local folder, type a local path, or enter `host:/path` for a remote destination
+2. **Set destination** — browse for a local folder, type a local path, enter `host:/path` for a remote destination, or click "Browse Remote" to pick a remote directory interactively
 3. **Choose mode** — Copy or Move, Files Only or Folders and Files
 4. **Choose transfer method** — Standard (cp/scp) or rsync
 5. **Set exclusions** (optional) — use the picker buttons or type wildcard patterns (e.g. `*.log`, `tmp*`) and click "+ File Pattern" or "+ Dir Pattern"
@@ -359,6 +373,7 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 ### 2026-02-20
 
+- **Added remote file browser** — "Browse Remote" buttons on both source and destination rows open an interactive SSH directory browser; navigate folders on any SSH host, select files or directories, and the chosen `host:/path` fills the entry field automatically; starts at the user's home directory for immediate usability
 - **Added Cancel button** — a "Cancel" button appears during transfers in the GUI; clicking it gracefully stops the transfer at the next file boundary, keeps already-copied files, and shows a summary dialog; in CLI mode, pressing Ctrl+C sends a cancellation signal with the same graceful behaviour
 - **Fixed remote single-file copy** — copying a single file from a remote source now works correctly (previously returned 0 files because `collect_remote_files` skipped the sole entry)
 - **Unified source entry field** — replaced the separate read-only source label and "Remote source" text field with a single editable entry; type a local path, `host:/path`, or use the Browse buttons to fill it; the source type (local directory, local file, or remote) is auto-detected

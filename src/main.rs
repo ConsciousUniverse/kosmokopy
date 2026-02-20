@@ -21,8 +21,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, Entry,
-    FileDialog, Label, Orientation, ProgressBar, ScrolledWindow, Separator, TextView, Window,
-    WrapMode,
+    FileDialog, Label, ListBox, Orientation, PolicyType, ProgressBar, ScrolledWindow, SelectionMode,
+    Separator, TextView, Window, WrapMode,
 };
 use sha2::{Sha256, Digest};
 use walkdir::WalkDir;
@@ -352,10 +352,12 @@ fn build_ui(app: &Application) {
 
     let btn_browse_folder = Button::with_label("Browse Folder…");
     let btn_browse_files = Button::with_label("Browse Files…");
+    let btn_browse_remote_src = Button::with_label("Browse Remote…");
 
     src_row.append(&src_entry);
     src_row.append(&btn_browse_folder);
     src_row.append(&btn_browse_files);
+    src_row.append(&btn_browse_remote_src);
     root.append(&src_row);
 
 
@@ -363,6 +365,8 @@ fn build_ui(app: &Application) {
     // ── Destination directory ─────────────────────────────────────────
     let dst_row = dir_row_editable("Destination Directory:");
     let dst_entry: Entry = dst_row.2.clone();
+    let btn_browse_remote_dst = Button::with_label("Browse Remote…");
+    dst_row.0.append(&btn_browse_remote_dst);
     root.append(&dst_row.0);
 
     // ── Copy / Move toggle ────────────────────────────────────────────
@@ -568,6 +572,40 @@ fn build_ui(app: &Application) {
         let dst_entry_c = dst_entry.clone();
         dst_row.1.connect_clicked(move |_| {
             pick_folder(&win_clone, dst_entry_c.clone());
+        });
+    }
+
+    // ── Browse Remote — Source ─────────────────────────────────────────
+    {
+        let win_clone = window.clone();
+        let src_entry_c = src_entry.clone();
+        let source_sel = source_selection.clone();
+        btn_browse_remote_src.connect_clicked(move |_| {
+            let current = src_entry_c.text().to_string();
+            let src_entry_c2 = src_entry_c.clone();
+            let source_sel2 = source_sel.clone();
+            show_remote_browser(&win_clone, &current, false, move |selected| {
+                src_entry_c2.set_text(&selected);
+                // Parse as Remote source
+                if let Some(pos) = selected.find(':') {
+                    let host = selected[..pos].to_string();
+                    let path = selected[pos + 1..].to_string();
+                    *source_sel2.borrow_mut() = SourceSelection::Remote(host, path);
+                }
+            });
+        });
+    }
+
+    // ── Browse Remote — Destination ───────────────────────────────────
+    {
+        let win_clone = window.clone();
+        let dst_entry_c = dst_entry.clone();
+        btn_browse_remote_dst.connect_clicked(move |_| {
+            let current = dst_entry_c.text().to_string();
+            let dst_entry_c2 = dst_entry_c.clone();
+            show_remote_browser(&win_clone, &current, true, move |selected| {
+                dst_entry_c2.set_text(&selected);
+            });
         });
     }
 
@@ -1106,6 +1144,525 @@ fn show_result_dialog(parent: &ApplicationWindow, title: &str, summary: &str, er
     vbox.append(&btn_ok);
 
     dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
+// ── Remote file browser ────────────────────────────────────────────────
+
+/// Entry in a remote directory listing.
+#[derive(Clone)]
+struct RemoteEntry {
+    name: String,
+    is_dir: bool,
+}
+
+/// Resolve the SSH user's home directory on the remote host.
+fn resolve_remote_home(host: &str) -> Result<String, String> {
+    let ctl = [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+        "-o", "ControlPersist=60",
+        "-o", "ConnectTimeout=10",
+    ];
+    let out = Command::new("ssh")
+        .args(&ctl)
+        .arg(host)
+        .arg("echo $HOME")
+        .output()
+        .map_err(|e| format!("SSH failed: {}", e))?;
+    if !out.status.success() {
+        return Err("Could not resolve home directory".to_string());
+    }
+    let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if home.is_empty() {
+        Err("Home directory is empty".to_string())
+    } else {
+        Ok(home)
+    }
+}
+
+/// List the contents of a remote directory via SSH.
+/// Returns a sorted vec of `RemoteEntry` (directories first, then files).
+fn list_remote_dir(host: &str, path: &str) -> Result<Vec<RemoteEntry>, String> {
+    let ctl = [
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r",
+        "-o", "ControlPersist=60",
+        "-o", "ConnectTimeout=10",
+    ];
+    let cmd = format!(
+        "ls -1apL {} 2>/dev/null",
+        shell_quote(path.trim_end_matches('/')),
+    );
+    let out = Command::new("ssh")
+        .args(&ctl)
+        .arg(host)
+        .arg(&cmd)
+        .output()
+        .map_err(|e| format!("SSH failed: {}", e))?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("Cannot list '{}': {}", path, stderr.trim()));
+    }
+
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() || line == "./" {
+            continue;
+        }
+        if line == "../" {
+            continue; // Handled by the Up button
+        }
+        if line.ends_with('/') {
+            dirs.push(RemoteEntry {
+                name: line.trim_end_matches('/').to_string(),
+                is_dir: true,
+            });
+        } else {
+            files.push(RemoteEntry {
+                name: line.to_string(),
+                is_dir: false,
+            });
+        }
+    }
+
+    dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    dirs.append(&mut files);
+    Ok(dirs)
+}
+
+/// Open a remote file browser dialog.
+/// When the user selects a path, `on_select` is called with `"host:/selected/path"`.
+fn show_remote_browser(
+    parent: &ApplicationWindow,
+    initial_text: &str,
+    select_dirs_only: bool,
+    on_select: impl Fn(String) + 'static,
+) {
+    // Parse any existing host:/path from the entry text
+    let (initial_host, initial_path) = if let Some(pos) = initial_text.find(':') {
+        let h = &initial_text[..pos];
+        let p = &initial_text[pos + 1..];
+        if !h.is_empty() && !h.contains('/') && !p.is_empty() {
+            (h.to_string(), p.to_string())
+        } else {
+            (String::new(), "~".to_string())
+        }
+    } else {
+        (String::new(), "~".to_string())
+    };
+
+    let dialog = Window::builder()
+        .title("Browse Remote Location")
+        .modal(true)
+        .transient_for(parent)
+        .default_width(520)
+        .default_height(480)
+        .resizable(true)
+        .build();
+
+    let vbox = GtkBox::new(Orientation::Vertical, 8);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    // ── Host row ──────────────────────────────────────────────────────
+    let host_row = GtkBox::new(Orientation::Horizontal, 6);
+    let host_label = Label::new(Some("Host:"));
+    host_label.set_width_chars(6);
+    host_label.set_xalign(0.0);
+    let host_entry = Entry::new();
+    host_entry.set_hexpand(true);
+    host_entry.set_placeholder_text(Some("user@hostname"));
+    host_entry.set_text(&initial_host);
+    let btn_connect = Button::with_label("Connect");
+    btn_connect.add_css_class("suggested-action");
+    host_row.append(&host_label);
+    host_row.append(&host_entry);
+    host_row.append(&btn_connect);
+    vbox.append(&host_row);
+
+    // ── Path row ──────────────────────────────────────────────────────
+    let path_row = GtkBox::new(Orientation::Horizontal, 6);
+    let path_label = Label::new(Some("Path:"));
+    path_label.set_width_chars(6);
+    path_label.set_xalign(0.0);
+    let path_entry = Entry::new();
+    path_entry.set_hexpand(true);
+    path_entry.set_text(&initial_path);
+    let btn_up = Button::with_label("↑ Up");
+    let btn_go = Button::with_label("Go");
+    path_row.append(&path_label);
+    path_row.append(&path_entry);
+    path_row.append(&btn_up);
+    path_row.append(&btn_go);
+    vbox.append(&path_row);
+
+    // ── Status label ──────────────────────────────────────────────────
+    let status = Label::new(Some("Enter a host and click Connect."));
+    status.set_halign(Align::Start);
+    status.add_css_class("dim-label");
+    vbox.append(&status);
+
+    // ── File list ─────────────────────────────────────────────────────
+    let listbox = ListBox::new();
+    listbox.set_selection_mode(SelectionMode::Single);
+    let scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .vexpand(true)
+        .child(&listbox)
+        .build();
+    vbox.append(&scroll);
+
+    // ── Action buttons ────────────────────────────────────────────────
+    let btn_row = GtkBox::new(Orientation::Horizontal, 8);
+    btn_row.set_halign(Align::End);
+    let btn_cancel = Button::with_label("Cancel");
+    let btn_select = Button::with_label("Select");
+    btn_select.add_css_class("suggested-action");
+    btn_select.set_sensitive(false);
+    btn_row.append(&btn_cancel);
+    btn_row.append(&btn_select);
+    vbox.append(&btn_row);
+
+    dialog.set_child(Some(&vbox));
+
+    // ── Shared state ──────────────────────────────────────────────────
+    // Entries is the listing for the current directory.
+    let entries: Rc<RefCell<Vec<RemoteEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    // selected_path will hold the path the user ultimately wants.
+    let selected_path: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+    // ── Populate the listbox from a listing ───────────────────────────
+    let populate: Rc<dyn Fn(String, String)> = Rc::new({
+        let listbox = listbox.clone();
+        let entries = entries.clone();
+        let status = status.clone();
+        let btn_select = btn_select.clone();
+        let path_entry = path_entry.clone();
+        let selected_path = selected_path.clone();
+        move |host: String, path: String| {
+            // Clear existing rows
+            while let Some(row) = listbox.row_at_index(0) {
+                listbox.remove(&row);
+            }
+            entries.borrow_mut().clear();
+            btn_select.set_sensitive(false);
+            *selected_path.borrow_mut() = None;
+
+            status.set_text("Loading…");
+
+            // Spawn thread for SSH listing, poll result on main loop
+            // The channel now also returns the (possibly resolved) path so
+            // we can update the path bar when "~" is expanded.
+            let (tx, rx) = mpsc::channel::<(String, Result<Vec<RemoteEntry>, String>)>();
+            let host_c = host.clone();
+            let path_c = path.clone();
+            thread::spawn(move || {
+                // Resolve "~" or paths starting with "~/" to an absolute path.
+                let resolved = if path_c == "~" || path_c.starts_with("~/") {
+                    match resolve_remote_home(&host_c) {
+                        Ok(home) => {
+                            if path_c == "~" {
+                                home
+                            } else {
+                                format!("{}/{}", home, &path_c[2..])
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send((path_c, Err(e)));
+                            return;
+                        }
+                    }
+                } else {
+                    path_c
+                };
+                let result = list_remote_dir(&host_c, &resolved);
+                let _ = tx.send((resolved, result));
+            });
+
+            let listbox_c = listbox.clone();
+            let entries_c = entries.clone();
+            let status_c = status.clone();
+            let btn_select_c = btn_select.clone();
+            let path_entry_c = path_entry.clone();
+            let selected_path_c = selected_path.clone();
+            let select_dirs_only_c = select_dirs_only;
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok((resolved_path, result)) => {
+                        // Update the path bar to the resolved absolute path
+                        path_entry_c.set_text(&resolved_path);
+                        match result {
+                            Ok(listing) => {
+                                let count = listing.len();
+                                for entry in &listing {
+                                    let row_box = GtkBox::new(Orientation::Horizontal, 8);
+                                    row_box.set_margin_top(2);
+                                    row_box.set_margin_bottom(2);
+                                    row_box.set_margin_start(6);
+                                    row_box.set_margin_end(6);
+
+                                    let icon = Label::new(Some(
+                                        if entry.is_dir { "📁" } else { "📄" },
+                                    ));
+                                    let name_label = Label::new(Some(&entry.name));
+                                    name_label.set_halign(Align::Start);
+                                    name_label.set_hexpand(true);
+
+                                    if entry.is_dir {
+                                        name_label.set_markup(&format!(
+                                            "<b>{}</b>",
+                                            glib::markup_escape_text(&entry.name)
+                                        ));
+                                    }
+
+                                    row_box.append(&icon);
+                                    row_box.append(&name_label);
+                                    listbox_c.append(&row_box);
+                                }
+                                *entries_c.borrow_mut() = listing;
+
+                                let dir_count =
+                                    entries_c.borrow().iter().filter(|e| e.is_dir).count();
+                                let file_count = count - dir_count;
+                                status_c.set_text(&format!(
+                                    "{} — {} folder(s), {} file(s)",
+                                    path_entry_c.text(),
+                                    dir_count,
+                                    file_count,
+                                ));
+
+                                if select_dirs_only_c {
+                                    btn_select_c.set_sensitive(true);
+                                    *selected_path_c.borrow_mut() =
+                                        Some(path_entry_c.text().to_string());
+                                }
+                            }
+                            Err(e) => {
+                                status_c.set_text(&format!("Error: {}", e));
+                            }
+                        }
+                        glib::ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        status_c.set_text("Error: listing thread terminated unexpectedly");
+                        glib::ControlFlow::Break
+                    }
+                }
+            });
+        }
+    });
+
+    // ── Connect button ────────────────────────────────────────────────
+    {
+        let populate = populate.clone();
+        let host_entry = host_entry.clone();
+        let path_entry = path_entry.clone();
+        btn_connect.connect_clicked(move |_| {
+            let host = host_entry.text().to_string().trim().to_string();
+            if host.is_empty() {
+                return;
+            }
+            let path = path_entry.text().to_string().trim().to_string();
+            let path = if path.is_empty() { "~".to_string() } else { path };
+            populate(host, path);
+        });
+    }
+
+    // ── Go button (navigate to typed path) ────────────────────────────
+    {
+        let populate = populate.clone();
+        let host_entry = host_entry.clone();
+        let path_entry = path_entry.clone();
+        btn_go.connect_clicked(move |_| {
+            let host = host_entry.text().to_string().trim().to_string();
+            if host.is_empty() {
+                return;
+            }
+            let path = path_entry.text().to_string().trim().to_string();
+            let path = if path.is_empty() { "~".to_string() } else { path };
+            populate(host, path);
+        });
+    }
+
+    // ── Up button ─────────────────────────────────────────────────────
+    {
+        let populate = populate.clone();
+        let host_entry = host_entry.clone();
+        let path_entry = path_entry.clone();
+        btn_up.connect_clicked(move |_| {
+            let host = host_entry.text().to_string().trim().to_string();
+            if host.is_empty() {
+                return;
+            }
+            let current = path_entry.text().to_string();
+            let parent = Path::new(&current)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let parent = if parent.is_empty() { "/".to_string() } else { parent };
+            path_entry.set_text(&parent);
+            populate(host, parent);
+        });
+    }
+
+    // ── Double-click on a row → navigate into directory ───────────────
+    {
+        let populate = populate.clone();
+        let host_entry = host_entry.clone();
+        let path_entry = path_entry.clone();
+        let entries = entries.clone();
+        let selected_path = selected_path.clone();
+        let btn_select = btn_select.clone();
+        listbox.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            // Clone the entry data we need, then drop the borrow BEFORE
+            // calling populate (which takes a mutable borrow on entries).
+            let entry_snapshot = {
+                let ents = entries.borrow();
+                ents.get(idx).cloned()
+            };
+            if let Some(entry) = entry_snapshot {
+                if entry.is_dir {
+                    let host = host_entry.text().to_string().trim().to_string();
+                    let current = path_entry.text().to_string();
+                    let new_path = format!(
+                        "{}/{}",
+                        current.trim_end_matches('/'),
+                        entry.name
+                    );
+                    path_entry.set_text(&new_path);
+                    populate(host, new_path);
+                } else if !select_dirs_only {
+                    // File selected — set and enable
+                    let current = path_entry.text().to_string();
+                    let file_path = format!(
+                        "{}/{}",
+                        current.trim_end_matches('/'),
+                        entry.name,
+                    );
+                    *selected_path.borrow_mut() = Some(file_path);
+                    btn_select.set_sensitive(true);
+                }
+            }
+        });
+    }
+
+    // ── Single click on a row → highlight / update selected_path ──────
+    {
+        let entries = entries.clone();
+        let path_entry = path_entry.clone();
+        let selected_path = selected_path.clone();
+        let btn_select = btn_select.clone();
+        listbox.connect_row_selected(move |_, row| {
+            if let Some(row) = row {
+                let idx = row.index() as usize;
+                let entry_snapshot = {
+                    let ents = entries.borrow();
+                    ents.get(idx).cloned()
+                };
+                if let Some(entry) = entry_snapshot {
+                    let current = path_entry.text().to_string();
+                    if entry.is_dir {
+                        let dir_path = format!(
+                            "{}/{}",
+                            current.trim_end_matches('/'),
+                            entry.name,
+                        );
+                        *selected_path.borrow_mut() = Some(dir_path);
+                        btn_select.set_sensitive(true);
+                    } else if !select_dirs_only {
+                        let file_path = format!(
+                            "{}/{}",
+                            current.trim_end_matches('/'),
+                            entry.name,
+                        );
+                        *selected_path.borrow_mut() = Some(file_path);
+                        btn_select.set_sensitive(true);
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Cancel button ─────────────────────────────────────────────────
+    {
+        let dialog = dialog.clone();
+        btn_cancel.connect_clicked(move |_| {
+            dialog.close();
+        });
+    }
+
+    // ── Select button ─────────────────────────────────────────────────
+    {
+        let dialog = dialog.clone();
+        let host_entry = host_entry.clone();
+        let path_entry = path_entry.clone();
+        let selected_path = selected_path.clone();
+        btn_select.connect_clicked(move |_| {
+            let host = host_entry.text().to_string().trim().to_string();
+            let path = selected_path
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| path_entry.text().to_string());
+            if !host.is_empty() && !path.is_empty() {
+                on_select(format!("{}:{}", host, path));
+            }
+            dialog.close();
+        });
+    }
+
+    // ── Enter key in path entry → Go ──────────────────────────────────
+    {
+        let populate = populate.clone();
+        let host_entry = host_entry.clone();
+        let path_entry_c = path_entry.clone();
+        path_entry.connect_activate(move |_| {
+            let host = host_entry.text().to_string().trim().to_string();
+            if host.is_empty() {
+                return;
+            }
+            let path = path_entry_c.text().to_string().trim().to_string();
+            let path = if path.is_empty() { "/".to_string() } else { path };
+            populate(host, path);
+        });
+    }
+
+    // ── Enter key in host entry → Connect ─────────────────────────────
+    {
+        let populate = populate.clone();
+        let host_entry_c = host_entry.clone();
+        let path_entry = path_entry.clone();
+        host_entry.connect_activate(move |_| {
+            let host = host_entry_c.text().to_string().trim().to_string();
+            if host.is_empty() {
+                return;
+            }
+            let path = path_entry.text().to_string().trim().to_string();
+            let path = if path.is_empty() { "/".to_string() } else { path };
+            populate(host, path);
+        });
+    }
+
+    // Auto-connect if host was pre-filled
+    if !initial_host.is_empty() {
+        let populate = populate.clone();
+        let host = initial_host.clone();
+        let path = initial_path.clone();
+        glib::idle_add_local_once(move || {
+            populate(host, path);
+        });
+    }
+
     dialog.present();
 }
 
