@@ -26,9 +26,11 @@ Environment variables (all optional — remote tests are skipped if unset):
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -41,6 +43,7 @@ KOSMOKOPY_BIN = os.environ.get(
     "KOSMOKOPY_BIN",
     str(_PROJECT_ROOT / "target" / "debug" / "kosmokopy"),
 )
+_REPORTS_DIR = _PROJECT_ROOT / "tests" / "reports"
 
 
 # ── Configuration from environment ──────────────────────────────────────
@@ -354,3 +357,121 @@ def remote_dest2():
     )
     yield REMOTE_HOST2, test_dir
     remote_rm_rf(REMOTE_HOST2, test_dir)
+
+
+# ── Automatic report generation ─────────────────────────────────────────
+
+_collected_results = []  # populated by pytest_runtest_makereport
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Capture every test outcome (setup / call / teardown)."""
+    outcome = yield
+    rep = outcome.get_result()
+    # We only care about the "call" phase (the actual test body),
+    # but also record setup/teardown failures.
+    if rep.when == "call" or (rep.when != "call" and rep.failed):
+        _collected_results.append(rep)
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Generate a timestamped report file after the full test run."""
+    _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d_%H%M%S")
+    report_path = _REPORTS_DIR / "report_{}.txt".format(timestamp)
+
+    passed = []
+    failed = []
+    skipped = []
+    errored = []
+
+    for rep in _collected_results:
+        nodeid = rep.nodeid
+        if rep.passed:
+            passed.append(nodeid)
+        elif rep.failed:
+            failed.append((nodeid, rep.longreprtext))
+        elif rep.skipped:
+            skipped.append((nodeid, str(rep.longrepr)))
+
+    # Also pick up skipped tests from the terminal reporter
+    # (skips during collection or setup won't appear in _collected_results)
+    if "skipped" in terminalreporter.stats:
+        already_skipped = {s[0] for s in skipped}
+        for rep in terminalreporter.stats["skipped"]:
+            if rep.nodeid not in already_skipped:
+                skipped.append((rep.nodeid, str(rep.longrepr)))
+
+    total = len(passed) + len(failed) + len(skipped) + len(errored)
+    duration = now - _session_start
+
+    lines = []
+    lines.append("=" * 72)
+    lines.append("  Kosmokopy Test Report")
+    lines.append("=" * 72)
+    lines.append("")
+    lines.append("Date     : {}".format(now.strftime("%Y-%m-%d %H:%M:%S")))
+    lines.append("Duration : {:.2f}s".format(duration.total_seconds()))
+    lines.append("Platform : {} {} ({})".format(
+        platform.system(), platform.release(), platform.machine(),
+    ))
+    lines.append("Python   : {}".format(platform.python_version()))
+    lines.append("Binary   : {}".format(KOSMOKOPY_BIN))
+    lines.append("")
+
+    lines.append("Remote hosts:")
+    lines.append("  Host 1 : {}".format(REMOTE_HOST or "(not configured)"))
+    if REMOTE_HOST:
+        lines.append("  Path 1 : {}".format(REMOTE_PATH))
+    lines.append("  Host 2 : {}".format(REMOTE_HOST2 or "(not configured)"))
+    if REMOTE_HOST2:
+        lines.append("  Path 2 : {}".format(REMOTE_PATH2))
+    lines.append("")
+
+    lines.append("-" * 72)
+    lines.append("  SUMMARY:  {} passed, {} failed, {} skipped  (total {})".format(
+        len(passed), len(failed), len(skipped), total,
+    ))
+    lines.append("-" * 72)
+    lines.append("")
+
+    if failed:
+        lines.append("FAILURES ({})".format(len(failed)))
+        lines.append("")
+        for nodeid, longrepr in failed:
+            lines.append("  FAIL  {}".format(nodeid))
+            for detail_line in longrepr.splitlines():
+                lines.append("        {}".format(detail_line))
+            lines.append("")
+
+    if skipped:
+        lines.append("SKIPPED ({})".format(len(skipped)))
+        lines.append("")
+        for nodeid, reason in skipped:
+            lines.append("  SKIP  {}  -- {}".format(nodeid, reason))
+        lines.append("")
+
+    lines.append("PASSED ({})".format(len(passed)))
+    lines.append("")
+    for nodeid in passed:
+        lines.append("  OK    {}".format(nodeid))
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append("")
+
+    report_text = "\n".join(lines)
+    report_path.write_text(report_text)
+
+    terminalreporter.write_sep("=", "Report saved to {}".format(report_path))
+
+
+# Track session start time
+_session_start = datetime.now()
+
+
+def pytest_sessionstart(session):
+    global _session_start
+    _session_start = datetime.now()

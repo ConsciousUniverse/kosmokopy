@@ -45,16 +45,17 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 **Wildcard patterns** support `*` (matches zero or more characters) and `?` (matches exactly one character). Matching is case-insensitive and applies to the file or directory **name** only (not the full path). For example, `te*` will match a file named `test.jpg` regardless of where it sits in the directory tree, but will not match a file inside a directory called `test/`.
 
-### Overwrite Handling
+### Conflict Handling
 
-Kosmokopy compares source and destination files byte-by-byte before deciding what to do:
+When a file already exists at the destination, Kosmokopy offers three strategies selected via the `--conflict` flag (CLI) or radio buttons (GUI):
 
-| Destination file  | Content                            | Copy mode                         | Move mode                               |
-| ----------------- | ---------------------------------- | --------------------------------- | --------------------------------------- |
-| Doesn't exist     | —                                 | Copy normally                     | Move normally                           |
-| Exists, identical | Same bytes                         | Skip ("identical at destination") | Delete source only (no transfer needed) |
-| Exists, different | Different + overwrite**on**  | Overwrite with new version        | Overwrite, then delete source           |
-| Exists, different | Different + overwrite**off** | Skip ("different version exists") | Skip                                    |
+| Destination file  | Content        | Skip mode                          | Overwrite mode                    | Rename mode                              |
+| ----------------- | -------------- | ---------------------------------- | --------------------------------- | ---------------------------------------- |
+| Doesn't exist     | —              | Copy/move normally                 | Copy/move normally                | Copy/move normally                       |
+| Exists, identical | Same bytes     | Skip ("identical at destination")  | Skip (identical)                  | Skip (identical)                         |
+| Exists, different | Different bytes | Skip ("already exists")           | Overwrite with source version     | Keep original, save source as `file (1).ext` |
+
+In **Move** mode, the source file is deleted after a successful transfer (or immediately if the destination is already identical). In **Rename** mode, the counter increments (`file (1).ext`, `file (2).ext`, …) until an unused name is found.
 
 ### Integrity Verification
 
@@ -98,7 +99,7 @@ Transfer files to or from remote machines, or between two remote machines, using
 - Hostnames must match entries in `~/.ssh/config`
 - Uses SSH connection multiplexing for performance
 - Creates remote directories automatically
-- Remote overwrite detection checks existing files before transfer
+- Remote conflict detection checks existing files before transfer (skip, overwrite, or rename)
 - Post-transfer SHA-256 hash verification ensures data integrity
 - Source files are deleted only after hash verification passes (move mode)
 - Both Standard (scp) and rsync methods are supported for all remote transfer directions
@@ -176,7 +177,7 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 3. **Choose mode** — Copy or Move, Files Only or Folders and Files
 4. **Choose transfer method** — Standard (cp/scp) or rsync
 5. **Set exclusions** (optional) — use the picker buttons or type wildcard patterns (e.g. `*.log`, `tmp*`) and click "+ File Pattern" or "+ Dir Pattern"
-6. **Toggle overwrite** (optional) — check "Overwrite existing files" to replace differing files
+6. **Choose conflict handling** (optional) — select Skip (default), Overwrite, or Rename to control how filename collisions are resolved
 7. **Click Transfer**
 
 ### Transfer Scenarios
@@ -197,16 +198,62 @@ Kosmokopy includes an external Python test suite that exercises the real Rust bi
 | Test file | What it covers |
 |-----------|---------------|
 | `test_local.py` | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation |
-| `test_conflicts.py` | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `_1`, `_2`, … auto-rename numbering scheme |
+| `test_conflicts.py` | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `(1)`, `(2)`, … auto-rename numbering scheme |
 | `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching |
-| `test_integrity.py` | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity |
+| `test_integrity.py` | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity, **plus 30 negative/corruption tests** — single-byte flip, appended byte, truncation, content replacement, file deletion, empty↔nonempty swap, nested corruption, remote corruption (append/truncate/replace/delete), and hash-helper self-tests |
 | `test_remote.py` | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, real source directory upload |
 
 ### How It Works
 
-Every test invokes `kosmokopy --cli` (the headless mode) via Python's `subprocess` module. The binary performs the actual file operation and prints a JSON result. Python then inspects the destination filesystem (or remote host via SSH) to verify correctness — file existence, hash match, source deletion (for moves), and correct error handling.
+Every test invokes `kosmokopy --cli` (the headless mode) via Python's `subprocess` module. The Rust binary performs the actual file operation and prints a JSON result. Python then inspects the destination filesystem (or remote host via SSH) to verify correctness — file existence, SHA-256 hash match, source deletion (for moves), and correct error handling.
 
 Remote tests use real SSH connections and are automatically **skipped** when the remote host environment variables are not set.
+
+### Negative / Corruption Tests
+
+The integrity test file includes 30 negative tests that prove the verification checks genuinely catch data corruption. The methodology is:
+
+1. **Copy files** using `kosmokopy --cli` (the real Rust binary performs the transfer)
+2. **Verify** the copy is intact (SHA-256 hash match, byte-identical comparison)
+3. **Deliberately corrupt** the destination file using one of the techniques below
+4. **Assert** that `sha256_of_file()` and `files_are_identical()` now detect the mismatch
+
+#### Corruption techniques used
+
+| Technique | How it works | What it proves |
+|-----------|-------------|----------------|
+| **Single-byte flip** | XOR one byte at the midpoint with `0xFF` | Detects minimal single-bit corruption |
+| **Appended byte** | Write `\x00` at end of file | Detects extra data appended after transfer |
+| **Truncation** | Rewrite file with only the first half of its content | Detects incomplete or truncated transfers |
+| **Content replacement** | Replace entire file contents with different text of same length | Detects wholesale content substitution |
+| **File deletion** | Remove the destination file entirely | Detects missing files |
+| **Empty → non-empty** | Write data into a previously zero-byte file | Detects corruption of empty files |
+| **Non-empty → empty** | Truncate a file to zero bytes | Detects total data loss |
+| **Nested corruption** | Corrupt files 1 and 2 levels deep in subdirectories | Proves checks work at any directory depth |
+| **Pinpointed corruption** | Corrupt one file among many, verify the rest are still intact | Proves corruption detection is per-file, not global |
+
+#### Coverage across transfer modes
+
+Each corruption technique is tested after transfers using:
+
+- **Standard local copy** (9 tests) — single byte flip, append, truncate, replace, delete, empty↔nonempty swap, nested, deeply nested
+- **rsync local copy** (3 tests) — byte flip, truncation, content replacement
+- **Move mode** (2 tests) — corrupt after move, pinpoint one corrupted file among many
+- **Flat / files-only mode** (1 test) — corruption in flattened output
+- **Strip-spaces mode** (1 test) — corruption after space-stripping renames
+- **Remote upload** (5 tests) — append, truncate, replace, and delete the remote file via SSH; pinpoint one corrupted remote file
+- **Remote download** (3 tests) — corrupt, truncate, and delete the local copy; verify against still-intact remote
+
+#### Hash helper self-tests (6 tests)
+
+The `sha256_of_file()` and `files_are_identical()` helpers are themselves validated:
+
+- Identical files → match
+- Different files → mismatch
+- Same size, different content → mismatch
+- One-byte difference → mismatch
+- Empty vs non-empty → mismatch
+- Both empty → match
 
 ### CLI Mode
 
@@ -223,14 +270,14 @@ kosmokopy --cli --src <dir> --dst <dir> [options]
 | `--src-files <a,b,c>` | Comma-separated list of individual source files |
 | `--move` | Move instead of copy |
 | `--conflict <skip\|overwrite\|rename>` | Conflict resolution strategy (default: `skip`) |
-| `--strip-spaces` | Replace spaces with underscores in destination filenames |
+| `--strip-spaces` | Remove spaces from destination filenames and directory names |
 | `--mode <files\|folders>` | Transfer mode (default: `folders`) |
 | `--method <standard\|rsync>` | Transfer method (default: `standard`) |
 | `--exclude <pattern>` | Exclusion pattern (repeatable) |
 
 Output is a single JSON line:
 ```json
-{"status":"finished","copied":3,"skipped":[],"excluded":0,"errors":[]}
+{"status":"finished","copied":3,"skipped":[],"excluded_files":0,"excluded_dirs":0,"errors":[]}
 ```
 
 ### Running the Tests
@@ -272,6 +319,18 @@ pipenv run python -m pytest tests/ -v
 
 Remote test directories are created automatically and cleaned up after each test.
 
+### Test Reports
+
+A timestamped report file is automatically generated after every test run and saved to `tests/reports/`. Each report includes:
+
+- Date, duration, platform, Python version, binary path
+- Remote host configuration
+- Full pass/fail/skip summary with counts
+- Failure details (traceback) for any failed tests
+- Complete list of all passed and skipped tests
+
+Report filenames follow the pattern `report_YYYY-MM-DD_HHMMSS.txt`.
+
 ## Author
 
 **Dan Bright** — [dan@danbright.uk](mailto:dan@danbright.uk)
@@ -291,7 +350,9 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 ### 2026-02-20
 
 - **Added `--cli` headless mode** — run all transfer operations from the command line without opening a GTK window; accepts `--src`, `--dst`, `--move`, `--conflict`, `--strip-spaces`, `--mode`, `--method`, `--exclude` and prints a JSON result
-- **Rewrote test suite to use the real binary** — all 76 tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
+- **Rewrote test suite to use the real binary** — all 106 tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
+- **Added 30 negative/corruption tests** — deliberately tamper with copied files (single-byte flip, append, truncate, replace, delete, empty↔nonempty) and verify that SHA-256 and byte-comparison checks catch every corruption; covers local standard, rsync, move, flat mode, strip-spaces, remote upload, and remote download scenarios; includes hash-helper self-tests
+- **Automatic test report generation** — a timestamped report is saved to `tests/reports/` after every pytest run, including platform info, remote host config, duration, and full pass/fail/skip breakdown with failure details
 
 ### 2026-02-19
 

@@ -347,7 +347,7 @@ class TestRemoteConflicts:
             src=src, dst="{}:{}".format(host, rdir), conflict="skip",
         )
         assert result["status"] == "finished"
-        assert "file.txt" in result["skipped"]
+        assert any("file.txt" in s for s in result["skipped"])
 
         # Remote should still have original
         content = remote_read(host, rdir + "/file.txt")
@@ -388,7 +388,7 @@ class TestRemoteConflicts:
 
         # Both should exist
         assert remote_file_exists(host, rdir + "/file.txt")
-        assert remote_file_exists(host, rdir + "/file_1.txt")
+        assert remote_file_exists(host, rdir + "/file (1).txt")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -404,7 +404,7 @@ class TestRemoteExclusions:
         result = run_kosmokopy(
             src=tmp_src_with_exclusions,
             dst="{}:{}".format(host, rdir),
-            exclude=["cache"],
+            exclude=["/cache"],
         )
         assert result["status"] == "finished"
         assert not remote_file_exists(host, rdir + "/cache/cached.dat")
@@ -415,7 +415,7 @@ class TestRemoteExclusions:
         result = run_kosmokopy(
             src=tmp_src_with_exclusions,
             dst="{}:{}".format(host, rdir),
-            exclude=["*.log", "*.tmp"],
+            exclude=["~*.log", "~*.tmp"],
         )
         assert result["status"] == "finished"
         assert not remote_file_exists(host, rdir + "/skip_me.log")
@@ -441,6 +441,6 @@ class TestStripSpacesRemote:
         assert result["status"] == "finished"
         assert result["errors"] == []
 
-        assert remote_file_exists(host, rdir + "/my_file.txt")
-        assert remote_file_exists(host, rdir + "/another_doc.pdf")
-        assert remote_file_exists(host, rdir + "/sub_folder/inner_file.txt")
+        assert remote_file_exists(host, rdir + "/myfile.txt")
+        assert remote_file_exists(host, rdir + "/anotherdoc.pdf")
+        assert remote_file_exists(host, rdir + "/subfolder/innerfile.txt")
