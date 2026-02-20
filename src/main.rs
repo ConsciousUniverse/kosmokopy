@@ -346,32 +346,19 @@ fn build_ui(app: &Application) {
     root.append(&src_heading);
 
     let src_row = GtkBox::new(Orientation::Horizontal, 8);
-    let src_label = Label::new(Some("(none)"));
-    src_label.set_hexpand(true);
-    src_label.set_halign(Align::Start);
-    src_label.set_ellipsize(gtk4::pango::EllipsizeMode::Start);
-    src_label.set_wrap(true);
-    src_label.set_max_width_chars(60);
+    let src_entry = Entry::new();
+    src_entry.set_hexpand(true);
+    src_entry.set_placeholder_text(Some("Local path or host:/remote/path"));
 
     let btn_browse_folder = Button::with_label("Browse Folder…");
     let btn_browse_files = Button::with_label("Browse Files…");
 
-    src_row.append(&src_label);
+    src_row.append(&src_entry);
     src_row.append(&btn_browse_folder);
     src_row.append(&btn_browse_files);
     root.append(&src_row);
 
-    // Remote source entry
-    let src_remote_row = GtkBox::new(Orientation::Horizontal, 8);
-    let src_remote_label = Label::new(Some("Remote Source:"));
-    src_remote_label.set_width_chars(20);
-    src_remote_label.set_xalign(0.0);
-    let src_remote_entry = Entry::new();
-    src_remote_entry.set_hexpand(true);
-    src_remote_entry.set_placeholder_text(Some("host:/remote/path (overrides local source)"));
-    src_remote_row.append(&src_remote_label);
-    src_remote_row.append(&src_remote_entry);
-    root.append(&src_remote_row);
+
 
     // ── Destination directory ─────────────────────────────────────────
     let dst_row = dir_row_editable("Destination Directory:");
@@ -509,14 +496,14 @@ fn build_ui(app: &Application) {
     // ── Browse Folder button ──────────────────────────────────────────
     {
         let win_clone = window.clone();
-        let src_label_c = src_label.clone();
+        let src_entry_c = src_entry.clone();
         let source_sel = source_selection.clone();
         btn_browse_folder.connect_clicked(move |_| {
             let dialog = FileDialog::builder()
                 .title("Select source folder")
                 .modal(true)
                 .build();
-            let src_label_c2 = src_label_c.clone();
+            let src_entry_c2 = src_entry_c.clone();
             let source_sel2 = source_sel.clone();
             dialog.select_folder(
                 Some(&win_clone),
@@ -524,7 +511,7 @@ fn build_ui(app: &Application) {
                 move |result| {
                     if let Ok(file) = result {
                         if let Some(path) = file.path() {
-                            src_label_c2.set_text(&path.to_string_lossy());
+                            src_entry_c2.set_text(&path.to_string_lossy());
                             *source_sel2.borrow_mut() = SourceSelection::Directory(path);
                         }
                     }
@@ -536,14 +523,14 @@ fn build_ui(app: &Application) {
     // ── Browse Files button ───────────────────────────────────────────
     {
         let win_clone = window.clone();
-        let src_label_c = src_label.clone();
+        let src_entry_c = src_entry.clone();
         let source_sel = source_selection.clone();
         btn_browse_files.connect_clicked(move |_| {
             let dialog = FileDialog::builder()
                 .title("Select files")
                 .modal(true)
                 .build();
-            let src_label_c2 = src_label_c.clone();
+            let src_entry_c2 = src_entry_c.clone();
             let source_sel2 = source_sel.clone();
             dialog.open_multiple(
                 Some(&win_clone),
@@ -566,7 +553,7 @@ fn build_ui(app: &Application) {
                             } else {
                                 format!("{} files selected", paths.len())
                             };
-                            src_label_c2.set_text(&display);
+                            src_entry_c2.set_text(&display);
                             *source_sel2.borrow_mut() = SourceSelection::Files(paths);
                         }
                     }
@@ -723,6 +710,7 @@ fn build_ui(app: &Application) {
 
     btn_start.connect_clicked({
         let source_selection = source_selection.clone();
+        let src_entry = src_entry.clone();
         let dst_entry = dst_entry.clone();
         let chk_move = chk_move.clone();
         let chk_folders_files = chk_folders_files.clone();
@@ -730,7 +718,6 @@ fn build_ui(app: &Application) {
         let chk_rename = chk_rename.clone();
         let chk_strip_spaces = chk_strip_spaces.clone();
         let chk_rsync = chk_rsync.clone();
-        let src_remote_entry = src_remote_entry.clone();
         let exclusions = exclusions.clone();
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
@@ -744,22 +731,27 @@ fn build_ui(app: &Application) {
                 return;
             }
 
-            let source_sel = source_selection.borrow().clone();
+            let src_text = src_entry.text().to_string().trim().to_string();
             let dst = dst_entry.text().to_string();
-            let remote_src_text = src_remote_entry.text().to_string().trim().to_string();
 
-            // If a remote source is specified, it overrides local source selection
-            let source_sel = if !remote_src_text.is_empty() {
-                let (rhost, rpath) = parse_destination(&remote_src_text);
-                match rhost {
-                    Some(host) => SourceSelection::Remote(host, rpath),
+            // Determine source: if the entry contains text, parse it;
+            // otherwise fall back to the source_selection set by browse buttons.
+            let source_sel = if !src_text.is_empty() {
+                let (host, path) = parse_destination(&src_text);
+                match host {
+                    Some(h) => SourceSelection::Remote(h, path),
                     None => {
-                        status_label.set_text("Remote source must be in host:/path format.");
-                        return;
+                        // Local path — could be a file or directory
+                        let p = PathBuf::from(&path);
+                        if p.is_file() {
+                            SourceSelection::Files(vec![p])
+                        } else {
+                            SourceSelection::Directory(p)
+                        }
                     }
                 }
             } else {
-                source_sel
+                source_selection.borrow().clone()
             };
 
             match &source_sel {
@@ -1431,7 +1423,10 @@ fn run_worker(
         let dest_file = match (&src_dir, transfer_mode) {
             // Directory source + "Folders and files": preserve directory structure
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
-                Ok(rel) => dst_path.join(rel),
+                Ok(rel) => {
+                    let root = sd.file_name().unwrap_or(sd.as_os_str());
+                    dst_path.join(root).join(rel)
+                }
                 Err(_) => {
                     skipped.push(format!("{}: outside source directory", file_path.display()));
                     continue;
@@ -1667,7 +1662,10 @@ fn run_local_rsync_worker(
         // Build destination path
         let dest_file = match (&src_dir, transfer_mode) {
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
-                Ok(rel) => dst_path.join(rel),
+                Ok(rel) => {
+                    let root = sd.file_name().unwrap_or(sd.as_os_str());
+                    dst_path.join(root).join(rel)
+                }
                 Err(_) => {
                     skipped.push(format!("{}: outside source directory", file_path.display()));
                     continue;
@@ -1929,7 +1927,11 @@ fn run_remote_worker(
     for file_path in &files {
         let rel_dest = match (&src_dir, transfer_mode) {
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
-                Ok(rel) => rel.to_string_lossy().to_string(),
+                Ok(rel) => {
+                    let root = sd.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    if root.is_empty() { rel.to_string_lossy().to_string() }
+                    else { format!("{}/{}", root, rel.to_string_lossy()) }
+                }
                 Err(_) => {
                     early_skipped.push(format!(
                         "{}: outside source directory",
@@ -2321,6 +2323,9 @@ fn run_remote_to_local_worker(
 
     let src_base = src_remote_base.trim_end_matches('/');
     let src_base_slash = format!("{}/", src_base);
+    let src_root_name = Path::new(src_base).file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
     let ssh_cmd = "ssh -o ControlMaster=auto -o ControlPath=/tmp/kosmokopy_ssh_%h_%p_%r -o ControlPersist=60";
 
     let mut copied = 0usize;
@@ -2343,7 +2348,10 @@ fn run_remote_to_local_worker(
             .unwrap_or(remote_file);
 
         let local_dest = match transfer_mode {
-            TransferMode::FoldersAndFiles => dst_path.join(rel),
+            TransferMode::FoldersAndFiles => {
+                if src_root_name.is_empty() { dst_path.join(rel) }
+                else { dst_path.join(&src_root_name).join(rel) }
+            }
             TransferMode::FilesOnly => {
                 let fname = Path::new(rel)
                     .file_name()
@@ -2556,6 +2564,9 @@ fn run_remote_to_remote_worker(
 
     let src_base = src_remote_base.trim_end_matches('/');
     let src_base_slash = format!("{}/", src_base);
+    let src_root_name = Path::new(src_base).file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
     let dst_base = dst_remote_base.trim_end_matches('/');
 
     // Build destination remote paths and ensure remote dirs
@@ -2569,7 +2580,10 @@ fn run_remote_to_remote_worker(
             .unwrap_or(remote_file);
 
         let dst_rel = match transfer_mode {
-            TransferMode::FoldersAndFiles => rel.to_string(),
+            TransferMode::FoldersAndFiles => {
+                if src_root_name.is_empty() { rel.to_string() }
+                else { format!("{}/{}", src_root_name, rel) }
+            }
             TransferMode::FilesOnly => {
                 Path::new(rel)
                     .file_name()
@@ -2898,6 +2912,9 @@ fn run_remote_to_remote_rsync_worker(
 
     let src_base = src_remote_base.trim_end_matches('/');
     let src_base_slash = format!("{}/", src_base);
+    let src_root_name = Path::new(src_base).file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
     let dst_base = dst_remote_base.trim_end_matches('/');
 
     let mut transfers: Vec<(String, String, PathBuf)> = Vec::new();
@@ -2910,7 +2927,10 @@ fn run_remote_to_remote_rsync_worker(
             .unwrap_or(remote_file);
 
         let dst_rel = match transfer_mode {
-            TransferMode::FoldersAndFiles => rel.to_string(),
+            TransferMode::FoldersAndFiles => {
+                if src_root_name.is_empty() { rel.to_string() }
+                else { format!("{}/{}", src_root_name, rel) }
+            }
             TransferMode::FilesOnly => {
                 Path::new(rel)
                     .file_name()
@@ -3309,7 +3329,11 @@ fn run_remote_rsync_worker(
     for file_path in &files {
         let rel_dest = match (&src_dir, transfer_mode) {
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
-                Ok(rel) => rel.to_string_lossy().to_string(),
+                Ok(rel) => {
+                    let root = sd.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    if root.is_empty() { rel.to_string_lossy().to_string() }
+                    else { format!("{}/{}", root, rel.to_string_lossy()) }
+                }
                 Err(_) => {
                     early_skipped.push(format!(
                         "{}: outside source directory",

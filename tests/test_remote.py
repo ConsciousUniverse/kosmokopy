@@ -61,7 +61,7 @@ class TestLocalToRemoteSCP:
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                remote_path = "{}/{}".format(rdir, rel)
+                remote_path = "{}/{}/{}".format(rdir, tmp_src.name, rel)
                 assert sha256_of_file(f) == sha256_remote(host, remote_path)
 
     def test_upload_nested_dirs(self, tmp_src, remote_dest):
@@ -69,8 +69,9 @@ class TestLocalToRemoteSCP:
         result = run_kosmokopy(src=tmp_src, dst="{}:{}".format(host, rdir))
         assert result["status"] == "finished"
 
-        assert remote_file_exists(host, rdir + "/subdir/nested.txt")
-        assert remote_file_exists(host, rdir + "/subdir/level2/bottom.txt")
+        root = "{}/{}".format(rdir, tmp_src.name)
+        assert remote_file_exists(host, root + "/subdir/nested.txt")
+        assert remote_file_exists(host, root + "/subdir/level2/bottom.txt")
 
     def test_upload_selected_files(self, tmp_src, remote_dest):
         host, rdir = remote_dest
@@ -114,7 +115,7 @@ class TestLocalToRemoteRsync:
             if f.is_file():
                 rel = f.relative_to(tmp_src)
                 assert sha256_of_file(f) == sha256_remote(
-                    host, "{}/{}".format(rdir, rel),
+                    host, "{}/{}/{}".format(rdir, tmp_src.name, rel),
                 )
 
 
@@ -143,9 +144,11 @@ class TestRemoteToLocalSCP:
         result = run_kosmokopy(src="{}:{}".format(host, rdir), dst=dst)
         assert result["status"] == "finished"
 
-        for f in dst.rglob("*"):
+        root_name = Path(rdir).name
+        root = dst / root_name
+        for f in root.rglob("*"):
             if f.is_file():
-                rel = f.relative_to(dst)
+                rel = f.relative_to(root)
                 remote_path = "{}/{}".format(rdir, rel)
                 assert sha256_of_file(f) == sha256_remote(host, remote_path)
 
@@ -156,8 +159,112 @@ class TestRemoteToLocalSCP:
         result = run_kosmokopy(src="{}:{}".format(host, rdir), dst=dst)
         assert result["status"] == "finished"
 
-        assert (dst / "rsub" / "remote_c.txt").exists()
-        assert (dst / "rsub" / "remote_c.txt").read_text() == "Remote nested C\n"
+        root_name = Path(rdir).name
+        assert (dst / root_name / "rsub" / "remote_c.txt").exists()
+        assert (dst / root_name / "rsub" / "remote_c.txt").read_text() == "Remote nested C\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Remote single-file download (regression test for collect_remote_files)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@requires_remote
+class TestRemoteSingleFileDownload:
+    """Downloading a single file from a remote host (not a directory tree)."""
+
+    def test_download_single_remote_file(self, tmp_path):
+        """Create one file on the remote, download it, verify content."""
+        if not (REMOTE_HOST and REMOTE_PATH):
+            pytest.skip("Remote host not configured")
+
+        import subprocess as sp
+        test_dir = "{}/single_file_test_{}".format(
+            REMOTE_PATH.rstrip("/"), id(object()),
+        )
+        sp.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST, "mkdir -p " + _sq(test_dir)],
+            check=True, capture_output=True,
+        )
+        sp.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST,
+             "echo 'single file content' > " + _sq(test_dir + "/only.txt")],
+            check=True, capture_output=True,
+        )
+
+        try:
+            dst = tmp_path / "dst"
+            result = run_kosmokopy(
+                src="{}:{}".format(REMOTE_HOST, test_dir), dst=dst,
+            )
+            assert result["status"] == "finished"
+            assert result["copied"] == 1
+            assert result["errors"] == []
+            root_name = Path(test_dir).name
+            assert (dst / root_name / "only.txt").exists()
+            assert (dst / root_name / "only.txt").read_text().strip() == "single file content"
+        finally:
+            remote_rm_rf(REMOTE_HOST, test_dir)
+
+    def test_download_single_remote_file_rsync(self, tmp_path):
+        """Same as above but via rsync method."""
+        if not (REMOTE_HOST and REMOTE_PATH):
+            pytest.skip("Remote host not configured")
+        import shutil
+        if shutil.which("rsync") is None:
+            pytest.skip("rsync not installed")
+
+        import subprocess as sp
+        test_dir = "{}/single_rsync_test_{}".format(
+            REMOTE_PATH.rstrip("/"), id(object()),
+        )
+        sp.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST, "mkdir -p " + _sq(test_dir)],
+            check=True, capture_output=True,
+        )
+        sp.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST,
+             "echo 'rsync single' > " + _sq(test_dir + "/rsingle.txt")],
+            check=True, capture_output=True,
+        )
+
+        try:
+            dst = tmp_path / "dst"
+            result = run_kosmokopy(
+                src="{}:{}".format(REMOTE_HOST, test_dir), dst=dst,
+                method="rsync",
+            )
+            assert result["status"] == "finished"
+            assert result["copied"] == 1
+            root_name = Path(test_dir).name
+            assert (dst / root_name / "rsingle.txt").exists()
+        finally:
+            remote_rm_rf(REMOTE_HOST, test_dir)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Remote single-file upload
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@requires_remote
+class TestRemoteSingleFileUpload:
+    """Upload a single file to a remote host."""
+
+    def test_upload_single_file(self, tmp_path, remote_dest):
+        host, rdir = remote_dest
+        src = tmp_path / "src"
+        src.mkdir()
+        f = src / "upload_only.txt"
+        f.write_text("upload only\n")
+        expected = sha256_of_file(f)
+
+        result = run_kosmokopy(
+            src_files=[f], dst="{}:{}".format(host, rdir), mode="files",
+        )
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+        assert sha256_remote(host, rdir + "/upload_only.txt") == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -189,9 +296,11 @@ class TestRemoteToLocalRsync:
         )
         assert result["status"] == "finished"
 
-        for f in dst.rglob("*"):
+        root_name = Path(rdir).name
+        root = dst / root_name
+        for f in root.rglob("*"):
             if f.is_file():
-                rel = f.relative_to(dst)
+                rel = f.relative_to(root)
                 remote_path = "{}/{}".format(rdir, rel)
                 assert sha256_of_file(f) == sha256_remote(host, remote_path)
 
@@ -228,11 +337,12 @@ class TestRemoteToRemoteSCPRelay:
         )
         assert result["status"] == "finished"
 
+        src_root = Path(src_dir).name
         src_files = remote_ls(src_host, src_dir)
         for full_path in src_files:
             rel = os.path.relpath(full_path, src_dir)
             src_hash = sha256_remote(src_host, full_path)
-            dst_hash = sha256_remote(dst_host, "{}/{}".format(dst_dir, rel))
+            dst_hash = sha256_remote(dst_host, "{}/{}/{}".format(dst_dir, src_root, rel))
             assert src_hash == dst_hash, "Hash mismatch for {}".format(rel)
 
 
@@ -282,7 +392,7 @@ class TestRealSourceToRemote:
         while first_local.is_dir():
             first_local = next(real_source.rglob("*"))
         rel = first_local.relative_to(real_source)
-        remote_path = "{}/{}".format(rdir, rel)
+        remote_path = "{}/{}/{}".format(rdir, real_source.name, rel)
         assert sha256_of_file(first_local) == sha256_remote(host, remote_path)
 
 
@@ -308,7 +418,7 @@ class TestRemoteMove:
         assert result["status"] == "finished"
         assert result["copied"] == 1
         assert not f.exists()
-        assert sha256_remote(host, rdir + "/to_move.txt") == expected
+        assert sha256_remote(host, rdir + "/src/to_move.txt") == expected
 
     def test_download_move_removes_remote(self, remote_src, tmp_path):
         host, rdir = remote_src
@@ -350,7 +460,7 @@ class TestRemoteConflicts:
         assert any("file.txt" in s for s in result["skipped"])
 
         # Remote should still have original
-        content = remote_read(host, rdir + "/file.txt")
+        content = remote_read(host, rdir + "/src/file.txt")
         assert content == b"original\n"
 
     def test_overwrite_existing_remote(self, tmp_path, remote_dest):
@@ -368,7 +478,7 @@ class TestRemoteConflicts:
         assert result["status"] == "finished"
         assert result["copied"] >= 1
 
-        content = remote_read(host, rdir + "/file.txt")
+        content = remote_read(host, rdir + "/src/file.txt")
         assert content == b"modified\n"
 
     def test_rename_existing_remote(self, tmp_path, remote_dest):
@@ -387,8 +497,8 @@ class TestRemoteConflicts:
         assert result["copied"] >= 1
 
         # Both should exist
-        assert remote_file_exists(host, rdir + "/file.txt")
-        assert remote_file_exists(host, rdir + "/file (1).txt")
+        assert remote_file_exists(host, rdir + "/src/file.txt")
+        assert remote_file_exists(host, rdir + "/src/file (1).txt")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -407,8 +517,8 @@ class TestRemoteExclusions:
             exclude=["/cache"],
         )
         assert result["status"] == "finished"
-        assert not remote_file_exists(host, rdir + "/cache/cached.dat")
-        assert remote_file_exists(host, rdir + "/keep.txt")
+        assert not remote_file_exists(host, rdir + "/source/cache/cached.dat")
+        assert remote_file_exists(host, rdir + "/source/keep.txt")
 
     def test_wildcard_exclude_upload(self, tmp_src_with_exclusions, remote_dest):
         host, rdir = remote_dest
@@ -418,9 +528,9 @@ class TestRemoteExclusions:
             exclude=["~*.log", "~*.tmp"],
         )
         assert result["status"] == "finished"
-        assert not remote_file_exists(host, rdir + "/skip_me.log")
-        assert not remote_file_exists(host, rdir + "/data.tmp")
-        assert remote_file_exists(host, rdir + "/keep.txt")
+        assert not remote_file_exists(host, rdir + "/source/skip_me.log")
+        assert not remote_file_exists(host, rdir + "/source/data.tmp")
+        assert remote_file_exists(host, rdir + "/source/keep.txt")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -441,6 +551,6 @@ class TestStripSpacesRemote:
         assert result["status"] == "finished"
         assert result["errors"] == []
 
-        assert remote_file_exists(host, rdir + "/myfile.txt")
-        assert remote_file_exists(host, rdir + "/anotherdoc.pdf")
-        assert remote_file_exists(host, rdir + "/subfolder/innerfile.txt")
+        assert remote_file_exists(host, rdir + "/sourcespaces/myfile.txt")
+        assert remote_file_exists(host, rdir + "/sourcespaces/anotherdoc.pdf")
+        assert remote_file_exists(host, rdir + "/sourcespaces/subfolder/innerfile.txt")

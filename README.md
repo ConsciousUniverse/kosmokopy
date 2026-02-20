@@ -2,7 +2,9 @@
 
 A GTK4 file copier and mover with filtering, integrity verification, and SSH remote transfer support.
 
-IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy your data. TEST AT YOUR OWN RISK!
+This application was 'vibe coded' using Claude Opus 4.6.
+
+IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the provided test suite; and in 'production' on my own systems), but file corruption and complete destruction of your data cannot be guaranteed! Test at your own risk!
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue)
 
@@ -14,9 +16,10 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 ### Source Selection
 
-- **Browse Folder** — select a local directory and recursively process all files within it
-- **Browse Files** — pick individual local files for transfer
-- **Remote source** — type `host:/remote/path` in the "Remote source" field to pull files from a remote machine (overrides local source selection when filled in)
+- **Source entry field** — type a local path or `host:/remote/path` directly into the source field
+- **Browse Folder** — opens a folder picker; the selected path fills the source field
+- **Browse Files** — opens a file picker for individual files; the selected file path(s) fill the source field
+- Typed paths are auto-detected: `host:/path` is treated as a remote source, plain paths as local directories or files
 
 ### Transfer Modes
 
@@ -80,16 +83,16 @@ Transfer files to or from remote machines, or between two remote machines, using
 
 **Local → Remote:**
 
-- Type `hostname:/remote/path` in the destination field (e.g. `ubuntu:/home/dan/backup`)
+- Type or browse a local source, then type `hostname:/remote/path` in the destination field (e.g. `ubuntu:/home/dan/backup`)
 
 **Remote → Local:**
 
-- Type `hostname:/remote/path` in the "Remote source" field
+- Type `hostname:/remote/path` in the source field
 - Set a local destination folder
 
 **Remote → Remote:**
 
-- Type `source_host:/path` in the "Remote source" field
+- Type `source_host:/path` in the source field
 - Type `dest_host:/path` in the destination field
 - Files are relayed through the local machine: downloaded from source, verified, uploaded to destination, verified again
 - The local machine acts as a secure intermediary — files are staged in a temporary directory that is cleaned up after transfer
@@ -172,9 +175,10 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 ## Usage
 
 1. **Select source** — choose one of:
-   - Click "Browse Folder" for a local directory
-   - Click "Browse Files" for individual local files
-   - Type `host:/remote/path` in the "Remote source" field for a remote source
+   - Type a local path directly in the source field
+   - Click "Browse Folder" to select a local directory (fills the source field)
+   - Click "Browse Files" to pick individual local files
+   - Type `host:/remote/path` in the source field for a remote source
 2. **Set destination** — browse for a local folder, type a local path, or enter `host:/path` for a remote destination
 3. **Choose mode** — Copy or Move, Files Only or Folders and Files
 4. **Choose transfer method** — Standard (cp/scp) or rsync
@@ -199,11 +203,12 @@ Kosmokopy includes an external Python test suite that exercises the real Rust bi
 
 | Test file              | What it covers                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test_local.py`      | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation                                                                                                                                                                                                                                                                           |
+| `test_local.py`      | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation, single-file copy/move                                                                                                                                                                                                                                                    |
 | `test_conflicts.py`  | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `(1)`, `(2)`, … auto-rename numbering scheme                                                                                                                                                                                                                              |
 | `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching                                                                                                                                                                                                                                             |
 | `test_integrity.py`  | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity,**plus 30 negative/corruption tests** — single-byte flip, appended byte, truncation, content replacement, file deletion, empty↔nonempty swap, nested corruption, remote corruption (append/truncate/replace/delete), and hash-helper self-tests |
-| `test_remote.py`     | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, real source directory upload                                                                                                                                                                                |
+| `test_remote.py`     | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, single-file remote upload/download, real source directory upload                                                                                                                                            |
+| `test_cancel.py`     | Graceful SIGINT cancellation — partial copy count, copied files intact, no errors, move-cancel preserves un-transferred sources, rsync cancel, cancel with exclusions, immediate cancel                                                                                                                                                                                                    |
 
 ### How It Works
 
@@ -356,8 +361,11 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 - **Added Cancel button** — a "Cancel" button appears during transfers in the GUI; clicking it gracefully stops the transfer at the next file boundary, keeps already-copied files, and shows a summary dialog; in CLI mode, pressing Ctrl+C sends a cancellation signal with the same graceful behaviour
 - **Fixed remote single-file copy** — copying a single file from a remote source now works correctly (previously returned 0 files because `collect_remote_files` skipped the sole entry)
+- **Unified source entry field** — replaced the separate read-only source label and "Remote source" text field with a single editable entry; type a local path, `host:/path`, or use the Browse buttons to fill it; the source type (local directory, local file, or remote) is auto-detected
+- **Added cancel test suite** (`test_cancel.py`) — 10 tests covering graceful SIGINT cancellation: partial copy counts, file integrity after cancel, move-cancel source preservation, rsync cancel, cancel with exclusions, and immediate cancel
+- **Added single-file tests** — 4 local single-file tests (standard/rsync/move/directory-with-one-file) and 3 remote single-file tests (download SCP, download rsync, upload)
 - **Added `--cli` headless mode** — run all transfer operations from the command line without opening a GTK window; accepts `--src`, `--dst`, `--move`, `--conflict`, `--strip-spaces`, `--mode`, `--method`, `--exclude` and prints a JSON result
-- **Rewrote test suite to use the real binary** — all 106 tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
+- **Rewrote test suite to use the real binary** — all tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
 - **Added 30 negative/corruption tests** — deliberately tamper with copied files (single-byte flip, append, truncate, replace, delete, empty↔nonempty) and verify that SHA-256 and byte-comparison checks catch every corruption; covers local standard, rsync, move, flat mode, strip-spaces, remote upload, and remote download scenarios; includes hash-helper self-tests
 - **Automatic test report generation** — a timestamped report is saved to `tests/reports/` after every pytest run, including platform info, remote host config, duration, and full pass/fail/skip breakdown with failure details
 
@@ -365,7 +373,7 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 - **Added conflict mode selection** — new `ConflictMode` enum (Skip / Overwrite / Rename) replaces the boolean overwrite toggle; radio buttons in the UI let users choose how filename collisions are handled
 - **Auto-rename on conflict** — when Rename mode is selected, conflicting files are saved as `file (1).ext`, `file (2).ext`, etc.; works for both local and remote destinations
-- **Added external Python test suite** — 104 tests across 5 files (`test_local`, `test_conflicts`, `test_exclusions`, `test_integrity`, `test_remote`) covering local/remote copy and move, all conflict modes, wildcard exclusions, SHA-256 verification, corruption detection, and remote-to-remote relay; remote tests auto-skip when environment variables are unset
+- **Added external Python test suite** — tests across 6 files (`test_local`, `test_conflicts`, `test_exclusions`, `test_integrity`, `test_remote`, `test_cancel`) covering local/remote copy and move, all conflict modes, wildcard exclusions, SHA-256 verification, corruption detection, cancellation, and remote-to-remote relay; remote tests auto-skip when environment variables are unset
 - **Added remote source support** — new "Remote source" text entry field accepts `host:/path` to pull files from a remote machine; overrides local source selection when filled in
 - **Added remote-to-local transfers** — download files from a remote host to a local destination with SHA-256 hash verification; supports both SCP and rsync methods
 - **Added remote-to-remote transfers** — transfer files between two remote hosts using the local machine as a secure relay; files are downloaded, verified, uploaded, and verified again before source deletion (move mode)

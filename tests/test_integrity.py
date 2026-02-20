@@ -43,10 +43,11 @@ class TestLocalCopyIntegrity:
         assert result["status"] == "finished"
         assert result["errors"] == []
 
+        root = tmp_dst / tmp_src.name
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                assert files_are_identical(f, tmp_dst / rel)
+                assert files_are_identical(f, root / rel)
 
     def test_binary_file_integrity(self, tmp_path):
         """Large binary file copied through the app stays intact."""
@@ -60,7 +61,7 @@ class TestLocalCopyIntegrity:
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
 
-        assert sha256_of_file(dst / "big.bin") == expected
+        assert sha256_of_file(dst / "src" / "big.bin") == expected
 
     def test_empty_file_integrity(self, tmp_path):
         src = tmp_path / "src"
@@ -71,9 +72,9 @@ class TestLocalCopyIntegrity:
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
 
-        assert (dst / "empty").exists()
-        assert (dst / "empty").stat().st_size == 0
-        assert sha256_of_file(dst / "empty") == hashlib.sha256(b"").hexdigest()
+        assert (dst / "src" / "empty").exists()
+        assert (dst / "src" / "empty").stat().st_size == 0
+        assert sha256_of_file(dst / "src" / "empty") == hashlib.sha256(b"").hexdigest()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -89,10 +90,11 @@ class TestLocalRsyncIntegrity:
         assert result["status"] == "finished"
         assert result["errors"] == []
 
+        root = tmp_dst / tmp_src.name
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                assert files_are_identical(f, tmp_dst / rel)
+                assert files_are_identical(f, root / rel)
 
     def test_rsync_large_binary(self, tmp_path):
         src = tmp_path / "src"
@@ -105,7 +107,7 @@ class TestLocalRsyncIntegrity:
         result = run_kosmokopy(src=src, dst=dst, method="rsync")
         assert result["status"] == "finished"
 
-        assert sha256_of_file(dst / "big.bin") == expected
+        assert sha256_of_file(dst / "src" / "big.bin") == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -129,7 +131,7 @@ class TestMoveIntegrity:
         assert result["copied"] == 1
 
         assert not (src / "move_me.bin").exists()
-        assert sha256_of_file(dst / "move_me.bin") == expected
+        assert sha256_of_file(dst / "src" / "move_me.bin") == expected
 
     def test_move_multiple_files(self, tmp_src, tmp_dst):
         originals = {}
@@ -140,9 +142,10 @@ class TestMoveIntegrity:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, move=True)
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         for rel, h in originals.items():
             assert not (tmp_src / rel).exists(), "Source not removed: {}".format(rel)
-            assert sha256_of_file(tmp_dst / rel) == h
+            assert sha256_of_file(root / rel) == h
 
     @requires_rsync
     def test_rsync_move(self, tmp_path):
@@ -157,7 +160,7 @@ class TestMoveIntegrity:
         assert result["status"] == "finished"
 
         assert not (src / "rsync_move.bin").exists()
-        assert sha256_of_file(dst / "rsync_move.bin") == expected
+        assert sha256_of_file(dst / "src" / "rsync_move.bin") == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -178,7 +181,7 @@ class TestRemoteUploadIntegrity:
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                remote_path = "{}/{}".format(rdir, rel)
+                remote_path = "{}/{}/{}".format(rdir, tmp_src.name, rel)
                 assert sha256_of_file(f) == sha256_remote(host, remote_path)
 
     def test_upload_large_binary(self, tmp_path, remote_dest):
@@ -191,7 +194,7 @@ class TestRemoteUploadIntegrity:
 
         result = run_kosmokopy(src=src, dst="{}:{}".format(host, rdir))
         assert result["status"] == "finished"
-        assert sha256_remote(host, rdir + "/big.bin") == expected
+        assert sha256_remote(host, rdir + "/src/big.bin") == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -217,7 +220,7 @@ class TestRemoteMoveIntegrity:
         assert result["copied"] == 1
 
         assert not f.exists()
-        assert sha256_remote(host, rdir + "/to_move.bin") == expected
+        assert sha256_remote(host, rdir + "/src/to_move.bin") == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,9 +240,11 @@ class TestRemoteDownloadIntegrity:
         assert result["errors"] == []
         assert result["copied"] >= 1
 
-        for f in dst.rglob("*"):
+        root_name = Path(rdir).name
+        root = dst / root_name
+        for f in root.rglob("*"):
             if f.is_file():
-                rel = f.relative_to(dst)
+                rel = f.relative_to(root)
                 remote_path = "{}/{}".format(rdir, rel)
                 assert sha256_of_file(f) == sha256_remote(host, remote_path)
 
@@ -285,17 +290,18 @@ class TestCorruptionDetectionLocal:
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
 
+        copied = dst / "src" / "file.bin"
         # Sanity: file is intact before corruption
-        assert sha256_of_file(dst / "file.bin") == original_hash
-        assert files_are_identical(src / "file.bin", dst / "file.bin")
+        assert sha256_of_file(copied) == original_hash
+        assert files_are_identical(src / "file.bin", copied)
 
         # Corrupt: flip one byte
-        corrupted = bytearray((dst / "file.bin").read_bytes())
+        corrupted = bytearray(copied.read_bytes())
         corrupted[len(corrupted) // 2] ^= 0xFF
-        (dst / "file.bin").write_bytes(bytes(corrupted))
+        copied.write_bytes(bytes(corrupted))
 
-        assert sha256_of_file(dst / "file.bin") != original_hash
-        assert not files_are_identical(src / "file.bin", dst / "file.bin")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "file.bin", copied)
 
     def test_appended_byte(self, tmp_path):
         """Appending a single byte is detected."""
@@ -308,14 +314,16 @@ class TestCorruptionDetectionLocal:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "msg.txt") == original_hash
+
+        copied = dst / "src" / "msg.txt"
+        assert sha256_of_file(copied) == original_hash
 
         # Corrupt: append one byte
-        with open(dst / "msg.txt", "ab") as f:
+        with open(copied, "ab") as f:
             f.write(b"\x00")
 
-        assert sha256_of_file(dst / "msg.txt") != original_hash
-        assert not files_are_identical(src / "msg.txt", dst / "msg.txt")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "msg.txt", copied)
 
     def test_truncated_file(self, tmp_path):
         """Truncating a copied file is detected."""
@@ -328,13 +336,15 @@ class TestCorruptionDetectionLocal:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "big.bin") == original_hash
+
+        copied = dst / "src" / "big.bin"
+        assert sha256_of_file(copied) == original_hash
 
         # Corrupt: truncate to half
-        (dst / "big.bin").write_bytes(data[:5000])
+        copied.write_bytes(data[:5000])
 
-        assert sha256_of_file(dst / "big.bin") != original_hash
-        assert not files_are_identical(src / "big.bin", dst / "big.bin")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "big.bin", copied)
 
     def test_replaced_with_different_content(self, tmp_path):
         """Replacing file contents entirely is detected."""
@@ -346,35 +356,38 @@ class TestCorruptionDetectionLocal:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "doc.txt") == original_hash
+
+        copied = dst / "src" / "doc.txt"
+        assert sha256_of_file(copied) == original_hash
 
         # Corrupt: replace with different content of same length
-        (dst / "doc.txt").write_text("Replaced document content\n")
+        copied.write_text("Replaced document content\n")
 
-        assert sha256_of_file(dst / "doc.txt") != original_hash
-        assert not files_are_identical(src / "doc.txt", dst / "doc.txt")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "doc.txt", copied)
 
     def test_deleted_file(self, tmp_src, tmp_dst):
         """Deleting a copied file is detected during scan."""
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst)
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         # Verify all files exist first
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                assert (tmp_dst / rel).exists()
+                assert (root / rel).exists()
 
         # Delete one file
-        (tmp_dst / "hello.txt").unlink()
-        assert not (tmp_dst / "hello.txt").exists()
+        (root / "hello.txt").unlink()
+        assert not (root / "hello.txt").exists()
 
         # Remaining files still match
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
                 if rel != Path("hello.txt"):
-                    assert files_are_identical(f, tmp_dst / rel)
+                    assert files_are_identical(f, root / rel)
 
     def test_empty_file_replaced_with_content(self, tmp_path):
         """Writing data to a previously empty file is detected."""
@@ -386,13 +399,15 @@ class TestCorruptionDetectionLocal:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "empty") == empty_hash
+
+        copied = dst / "src" / "empty"
+        assert sha256_of_file(copied) == empty_hash
 
         # Corrupt: put data in the empty file
-        (dst / "empty").write_bytes(b"no longer empty")
+        copied.write_bytes(b"no longer empty")
 
-        assert sha256_of_file(dst / "empty") != empty_hash
-        assert not files_are_identical(src / "empty", dst / "empty")
+        assert sha256_of_file(copied) != empty_hash
+        assert not files_are_identical(src / "empty", copied)
 
     def test_nonempty_file_replaced_with_empty(self, tmp_path):
         """Truncating a file to zero bytes is detected."""
@@ -404,20 +419,23 @@ class TestCorruptionDetectionLocal:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst)
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "data.bin") == original_hash
+
+        copied = dst / "src" / "data.bin"
+        assert sha256_of_file(copied) == original_hash
 
         # Corrupt: truncate to zero
-        (dst / "data.bin").write_bytes(b"")
+        copied.write_bytes(b"")
 
-        assert sha256_of_file(dst / "data.bin") != original_hash
-        assert not files_are_identical(src / "data.bin", dst / "data.bin")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "data.bin", copied)
 
     def test_corruption_in_nested_file(self, tmp_src, tmp_dst):
         """Corruption in a nested subdirectory file is detected."""
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst)
         assert result["status"] == "finished"
 
-        nested = tmp_dst / "subdir" / "nested.txt"
+        root = tmp_dst / tmp_src.name
+        nested = root / "subdir" / "nested.txt"
         assert nested.exists()
         original_hash = sha256_of_file(tmp_src / "subdir" / "nested.txt")
         assert sha256_of_file(nested) == original_hash
@@ -435,7 +453,8 @@ class TestCorruptionDetectionLocal:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst)
         assert result["status"] == "finished"
 
-        deep = tmp_dst / "subdir" / "level2" / "bottom.txt"
+        root = tmp_dst / tmp_src.name
+        deep = root / "subdir" / "level2" / "bottom.txt"
         src_deep = tmp_src / "subdir" / "level2" / "bottom.txt"
         assert files_are_identical(src_deep, deep)
 
@@ -464,14 +483,16 @@ class TestCorruptionDetectionRsync:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst, method="rsync")
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "big.bin") == original_hash
 
-        corrupted = bytearray((dst / "big.bin").read_bytes())
+        copied = dst / "src" / "big.bin"
+        assert sha256_of_file(copied) == original_hash
+
+        corrupted = bytearray(copied.read_bytes())
         corrupted[0] ^= 0x01
-        (dst / "big.bin").write_bytes(bytes(corrupted))
+        copied.write_bytes(bytes(corrupted))
 
-        assert sha256_of_file(dst / "big.bin") != original_hash
-        assert not files_are_identical(src / "big.bin", dst / "big.bin")
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "big.bin", copied)
 
     def test_rsync_truncated_file(self, tmp_path):
         src = tmp_path / "src"
@@ -483,25 +504,28 @@ class TestCorruptionDetectionRsync:
         dst = tmp_path / "dst"
         result = run_kosmokopy(src=src, dst=dst, method="rsync")
         assert result["status"] == "finished"
-        assert sha256_of_file(dst / "file.bin") == original_hash
 
-        (dst / "file.bin").write_bytes(data[:100])
+        copied = dst / "src" / "file.bin"
+        assert sha256_of_file(copied) == original_hash
 
-        assert sha256_of_file(dst / "file.bin") != original_hash
-        assert not files_are_identical(src / "file.bin", dst / "file.bin")
+        copied.write_bytes(data[:100])
+
+        assert sha256_of_file(copied) != original_hash
+        assert not files_are_identical(src / "file.bin", copied)
 
     def test_rsync_file_replaced(self, tmp_src, tmp_dst):
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, method="rsync")
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         original_hash = sha256_of_file(tmp_src / "hello.txt")
-        assert sha256_of_file(tmp_dst / "hello.txt") == original_hash
+        assert sha256_of_file(root / "hello.txt") == original_hash
 
-        (tmp_dst / "hello.txt").write_text("COMPLETELY DIFFERENT\n")
+        (root / "hello.txt").write_text("COMPLETELY DIFFERENT\n")
 
-        assert sha256_of_file(tmp_dst / "hello.txt") != original_hash
+        assert sha256_of_file(root / "hello.txt") != original_hash
         assert not files_are_identical(
-            tmp_src / "hello.txt", tmp_dst / "hello.txt",
+            tmp_src / "hello.txt", root / "hello.txt",
         )
 
 
@@ -527,14 +551,16 @@ class TestCorruptionDetectionMove:
         result = run_kosmokopy(src=src, dst=dst, move=True)
         assert result["status"] == "finished"
         assert not (src / "important.bin").exists()
-        assert sha256_of_file(dst / "important.bin") == original_hash
+
+        copied = dst / "src" / "important.bin"
+        assert sha256_of_file(copied) == original_hash
 
         # Corrupt the moved file
-        corrupted = bytearray((dst / "important.bin").read_bytes())
+        corrupted = bytearray(copied.read_bytes())
         corrupted[-1] ^= 0xFF
-        (dst / "important.bin").write_bytes(bytes(corrupted))
+        copied.write_bytes(bytes(corrupted))
 
-        assert sha256_of_file(dst / "important.bin") != original_hash
+        assert sha256_of_file(copied) != original_hash
 
     def test_move_multiple_then_corrupt_one(self, tmp_src, tmp_dst):
         """Corrupting one file among many is pinpointed."""
@@ -546,18 +572,19 @@ class TestCorruptionDetectionMove:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, move=True)
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         # Verify all intact
         for rel, h in originals.items():
-            assert sha256_of_file(tmp_dst / rel) == h
+            assert sha256_of_file(root / rel) == h
 
         # Corrupt just one
-        target = tmp_dst / "hello.txt"
+        target = root / "hello.txt"
         target.write_text("CORRUPTED\n")
 
         corrupted_count = 0
         intact_count = 0
         for rel, h in originals.items():
-            if sha256_of_file(tmp_dst / rel) != h:
+            if sha256_of_file(root / rel) != h:
                 corrupted_count += 1
             else:
                 intact_count += 1
@@ -713,16 +740,16 @@ class TestCorruptionDetectionRemoteUpload:
         assert result["status"] == "finished"
 
         # Verify intact
-        assert sha256_remote(host, rdir + "/test.bin") == original_hash
+        assert sha256_remote(host, rdir + "/src/test.bin") == original_hash
 
         # Corrupt remotely: append a byte
         subprocess.run(
             ["ssh"] + SSH_CTL + [host,
-             "printf '\\x00' >> " + _sq(rdir + "/test.bin")],
+             "printf '\\x00' >> " + _sq(rdir + "/src/test.bin")],
             check=True, capture_output=True,
         )
 
-        assert sha256_remote(host, rdir + "/test.bin") != original_hash
+        assert sha256_remote(host, rdir + "/src/test.bin") != original_hash
 
     def test_upload_then_truncate_remote(self, tmp_path, remote_dest):
         """Truncating a remote file after upload is detected."""
@@ -735,16 +762,16 @@ class TestCorruptionDetectionRemoteUpload:
 
         result = run_kosmokopy(src=src, dst="{}:{}".format(host, rdir))
         assert result["status"] == "finished"
-        assert sha256_remote(host, rdir + "/big.bin") == original_hash
+        assert sha256_remote(host, rdir + "/src/big.bin") == original_hash
 
         # Truncate remotely
         subprocess.run(
             ["ssh"] + SSH_CTL + [host,
-             "truncate -s 100 " + _sq(rdir + "/big.bin")],
+             "truncate -s 100 " + _sq(rdir + "/src/big.bin")],
             check=True, capture_output=True,
         )
 
-        assert sha256_remote(host, rdir + "/big.bin") != original_hash
+        assert sha256_remote(host, rdir + "/src/big.bin") != original_hash
 
     def test_upload_then_replace_remote(self, tmp_path, remote_dest):
         """Replacing remote file content entirely is detected."""
@@ -756,16 +783,16 @@ class TestCorruptionDetectionRemoteUpload:
 
         result = run_kosmokopy(src=src, dst="{}:{}".format(host, rdir))
         assert result["status"] == "finished"
-        assert sha256_remote(host, rdir + "/doc.txt") == original_hash
+        assert sha256_remote(host, rdir + "/src/doc.txt") == original_hash
 
         # Replace remotely
         subprocess.run(
             ["ssh"] + SSH_CTL + [host,
-             "echo 'CORRUPTED' > " + _sq(rdir + "/doc.txt")],
+             "echo 'CORRUPTED' > " + _sq(rdir + "/src/doc.txt")],
             check=True, capture_output=True,
         )
 
-        assert sha256_remote(host, rdir + "/doc.txt") != original_hash
+        assert sha256_remote(host, rdir + "/src/doc.txt") != original_hash
 
     def test_upload_then_delete_remote(self, tmp_path, remote_dest):
         """Deleting a remote file after upload means it no longer exists."""
@@ -776,16 +803,16 @@ class TestCorruptionDetectionRemoteUpload:
 
         result = run_kosmokopy(src=src, dst="{}:{}".format(host, rdir))
         assert result["status"] == "finished"
-        assert remote_file_exists(host, rdir + "/remove_me.txt")
+        assert remote_file_exists(host, rdir + "/src/remove_me.txt")
 
         # Delete remotely
         subprocess.run(
             ["ssh"] + SSH_CTL + [host,
-             "rm " + _sq(rdir + "/remove_me.txt")],
+             "rm " + _sq(rdir + "/src/remove_me.txt")],
             check=True, capture_output=True,
         )
 
-        assert not remote_file_exists(host, rdir + "/remove_me.txt")
+        assert not remote_file_exists(host, rdir + "/src/remove_me.txt")
 
     def test_upload_multiple_corrupt_one_remote(self, tmp_src, remote_dest):
         """Corrupting one of several uploaded files is pinpointed."""
@@ -801,19 +828,19 @@ class TestCorruptionDetectionRemoteUpload:
 
         # Verify all intact
         for rel, h in originals.items():
-            remote_path = "{}/{}".format(rdir, rel)
+            remote_path = "{}/{}/{}".format(rdir, tmp_src.name, rel)
             assert sha256_remote(host, remote_path) == h
 
         # Corrupt just hello.txt
         subprocess.run(
             ["ssh"] + SSH_CTL + [host,
-             "echo 'CORRUPT' > " + _sq(rdir + "/hello.txt")],
+             "echo 'CORRUPT' > " + _sq(rdir + "/" + tmp_src.name + "/hello.txt")],
             check=True, capture_output=True,
         )
 
         corrupted_count = 0
         for rel, h in originals.items():
-            remote_path = "{}/{}".format(rdir, rel)
+            remote_path = "{}/{}/{}".format(rdir, tmp_src.name, rel)
             if sha256_remote(host, remote_path) != h:
                 corrupted_count += 1
 
@@ -840,8 +867,9 @@ class TestCorruptionDetectionRemoteDownload:
         result = run_kosmokopy(src="{}:{}".format(host, rdir), dst=dst)
         assert result["status"] == "finished"
 
+        root_name = Path(rdir).name
         # Pick a file, record its remote hash
-        target = dst / "remote_a.txt"
+        target = dst / root_name / "remote_a.txt"
         assert target.exists()
         remote_hash = sha256_remote(host, rdir + "/remote_a.txt")
         assert sha256_of_file(target) == remote_hash
@@ -859,7 +887,8 @@ class TestCorruptionDetectionRemoteDownload:
         result = run_kosmokopy(src="{}:{}".format(host, rdir), dst=dst)
         assert result["status"] == "finished"
 
-        target = dst / "remote_b.bin"
+        root_name = Path(rdir).name
+        target = dst / root_name / "remote_b.bin"
         assert target.exists()
         remote_hash = sha256_remote(host, rdir + "/remote_b.bin")
         assert sha256_of_file(target) == remote_hash
@@ -877,7 +906,8 @@ class TestCorruptionDetectionRemoteDownload:
         result = run_kosmokopy(src="{}:{}".format(host, rdir), dst=dst)
         assert result["status"] == "finished"
 
-        target = dst / "remote_a.txt"
+        root_name = Path(rdir).name
+        target = dst / root_name / "remote_a.txt"
         assert target.exists()
         target.unlink()
         assert not target.exists()

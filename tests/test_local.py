@@ -43,15 +43,17 @@ class TestLocalCopyStandard:
         assert result["status"] == "finished"
         assert result["copied"] == 6
 
-        assert (tmp_dst / "hello.txt").exists()
-        assert (tmp_dst / "subdir" / "nested.txt").exists()
-        assert (tmp_dst / "subdir" / "level2" / "bottom.txt").exists()
+        root = tmp_dst / tmp_src.name  # root folder preserved
+        assert root.exists()
+        assert (root / "hello.txt").exists()
+        assert (root / "subdir" / "nested.txt").exists()
+        assert (root / "subdir" / "level2" / "bottom.txt").exists()
 
         # Verify content integrity
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                dst_f = tmp_dst / rel
+                dst_f = root / rel
                 assert dst_f.exists()
                 assert files_are_identical(f, dst_f)
 
@@ -60,10 +62,11 @@ class TestLocalCopyStandard:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst)
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                assert sha256_of_file(f) == sha256_of_file(tmp_dst / rel)
+                assert sha256_of_file(f) == sha256_of_file(root / rel)
 
     def test_copy_creates_destination_dir(self, tmp_src, tmp_path):
         """Destination directory is created if it doesn't exist."""
@@ -87,6 +90,39 @@ class TestLocalCopyStandard:
         assert (tmp_dst / "hello.txt").exists()
         assert (tmp_dst / "data.bin").exists()
 
+    def test_root_folder_preserved(self, tmp_path):
+        """Regression: the source root folder name must appear in destination.
+
+        Previously, only the *contents* of the source directory were copied
+        directly into the destination, losing the top-level folder name.
+        E.g. ``/src/myFolder/sub/file.txt`` ended up as ``dst/sub/file.txt``
+        instead of ``dst/myFolder/sub/file.txt``.
+        """
+        src = tmp_path / "MyRootFolder"
+        src.mkdir()
+        (src / "a.txt").write_text("aaa\n")
+        sub = src / "child"
+        sub.mkdir()
+        (sub / "b.txt").write_text("bbb\n")
+
+        dst = tmp_path / "dst"
+        result = run_kosmokopy(src=src, dst=dst, mode="folders")
+        assert result["status"] == "finished"
+        assert result["copied"] == 2
+        assert result["errors"] == []
+
+        # Root folder "MyRootFolder" must exist inside dst
+        root = dst / "MyRootFolder"
+        assert root.is_dir(), "Root folder not preserved in destination"
+        assert (root / "a.txt").exists()
+        assert (root / "a.txt").read_text() == "aaa\n"
+        assert (root / "child" / "b.txt").exists()
+        assert (root / "child" / "b.txt").read_text() == "bbb\n"
+
+        # Files must NOT appear directly in dst (the old buggy behavior)
+        assert not (dst / "a.txt").exists(), "File landed flat — root folder lost"
+        assert not (dst / "child").exists(), "Subdir landed flat — root folder lost"
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Standard local move
@@ -104,10 +140,11 @@ class TestLocalMoveStandard:
         assert result["status"] == "finished"
         assert result["copied"] == 6
 
+        root = tmp_dst / tmp_src.name
         # Source files gone
         assert not src_file.exists()
         # Dest has the content
-        assert (tmp_dst / "hello.txt").read_text() == original_content
+        assert (root / "hello.txt").read_text() == original_content
 
     def test_move_preserves_structure(self, tmp_src, tmp_dst):
         """Move with FoldersAndFiles preserves directory layout."""
@@ -117,9 +154,10 @@ class TestLocalMoveStandard:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, move=True)
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         # All originals should be in dst, not in src
         for rel in originals:
-            assert (tmp_dst / rel).exists()
+            assert (root / rel).exists()
             assert not (tmp_src / rel).exists()
 
 
@@ -136,18 +174,20 @@ class TestLocalCopyRsync:
         assert result["status"] == "finished"
         assert result["copied"] == 6
 
-        assert (tmp_dst / "subdir" / "nested.txt").exists()
-        assert (tmp_dst / "subdir" / "level2" / "bottom.txt").exists()
+        root = tmp_dst / tmp_src.name
+        assert (root / "subdir" / "nested.txt").exists()
+        assert (root / "subdir" / "level2" / "bottom.txt").exists()
 
     def test_rsync_checksum_verification(self, tmp_src, tmp_dst):
         """rsync transfers match SHA-256 hashes."""
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, method="rsync")
         assert result["status"] == "finished"
 
+        root = tmp_dst / tmp_src.name
         for f in tmp_src.rglob("*"):
             if f.is_file():
                 rel = f.relative_to(tmp_src)
-                assert sha256_of_file(f) == sha256_of_file(tmp_dst / rel)
+                assert sha256_of_file(f) == sha256_of_file(root / rel)
 
     def test_rsync_flat_mode(self, tmp_src, tmp_dst):
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, method="rsync", mode="files")
@@ -168,9 +208,10 @@ class TestLocalMoveRsync:
         assert result["status"] == "finished"
         assert result["copied"] == 6
 
+        root = tmp_dst / tmp_src.name
         for rel, h in originals.items():
             assert not (tmp_src / rel).exists()
-            assert sha256_of_file(tmp_dst / rel) == h
+            assert sha256_of_file(root / rel) == h
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -208,4 +249,68 @@ class TestStripSpaces:
             src=tmp_src_with_spaces, dst=tmp_dst, strip_spaces=False,
         )
         assert result["status"] == "finished"
-        assert (tmp_dst / "my file.txt").exists()
+        root = tmp_dst / tmp_src_with_spaces.name
+        assert (root / "my file.txt").exists()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Single-file source
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestSingleFileCopy:
+    """Copy or move a single file (not a directory)."""
+
+    def test_single_file_standard(self, tmp_path):
+        """Copy a single file by passing it as --src-files."""
+        src = tmp_path / "src"
+        src.mkdir()
+        f = src / "only.txt"
+        f.write_text("only file\n")
+        dst = tmp_path / "dst"
+
+        result = run_kosmokopy(src_files=[f], dst=dst, mode="files")
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+        assert (dst / "only.txt").exists()
+        assert files_are_identical(f, dst / "only.txt")
+
+    def test_single_file_rsync(self, tmp_path):
+        """Copy a single file via rsync."""
+        src = tmp_path / "src"
+        src.mkdir()
+        f = src / "only.bin"
+        f.write_bytes(os.urandom(1024))
+        dst = tmp_path / "dst"
+
+        result = run_kosmokopy(src_files=[f], dst=dst, mode="files", method="rsync")
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+        assert files_are_identical(f, dst / "only.bin")
+
+    def test_single_file_move(self, tmp_path):
+        """Move a single file — source should be deleted."""
+        src = tmp_path / "src"
+        src.mkdir()
+        f = src / "moveme.txt"
+        f.write_text("move me\n")
+        expected_hash = sha256_of_file(f)
+        dst = tmp_path / "dst"
+
+        result = run_kosmokopy(src_files=[f], dst=dst, mode="files", move=True)
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+        assert not f.exists()
+        assert sha256_of_file(dst / "moveme.txt") == expected_hash
+
+    def test_single_file_directory_source(self, tmp_path):
+        """A directory containing only one file copies correctly."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "solo.txt").write_text("solo\n")
+        dst = tmp_path / "dst"
+
+        result = run_kosmokopy(src=src, dst=dst)
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+        assert (dst / "src" / "solo.txt").exists()

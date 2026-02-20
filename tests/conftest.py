@@ -139,6 +139,66 @@ def run_kosmokopy(
     }
 
 
+def run_kosmokopy_with_cancel(
+    *,
+    src=None,
+    dst,
+    src_files=None,
+    move=False,
+    conflict="skip",
+    strip_spaces=False,
+    mode="folders",
+    method="standard",
+    exclude=None,
+    cancel_after=0.3,
+):
+    """
+    Invoke ``kosmokopy --cli`` and send SIGINT after *cancel_after* seconds.
+
+    Returns the parsed JSON result dict (status should be ``"cancelled"``).
+    """
+    import signal
+    import time
+
+    cmd = [KOSMOKOPY_BIN, "--cli"]
+
+    if src is not None:
+        cmd += ["--src", str(src)]
+    if src_files is not None:
+        cmd += ["--src-files", ",".join(str(f) for f in src_files)]
+
+    cmd += ["--dst", str(dst)]
+
+    if move:
+        cmd.append("--move")
+
+    cmd += ["--conflict", conflict]
+
+    if strip_spaces:
+        cmd.append("--strip-spaces")
+
+    cmd += ["--mode", mode]
+    cmd += ["--method", method]
+
+    if exclude:
+        for pat in exclude:
+            cmd += ["--exclude", pat]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(cancel_after)
+    proc.send_signal(signal.SIGINT)
+    stdout, stderr = proc.communicate(timeout=30)
+
+    stdout = stdout.strip()
+    if stdout:
+        return json.loads(stdout)
+
+    return {
+        "status": "error",
+        "message": f"exit code {proc.returncode}: {stderr.strip()}",
+    }
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 def sha256_of_file(path):
