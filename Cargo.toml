@@ -10,3 +10,4 @@ description = "GTK4 file copier/mover — recursively copies or moves files whil
 gtk4 = { version = "0.9", features = ["v4_10"] }
 walkdir = "2"
 sha2 = "0.10"
+ctrlc = "3"

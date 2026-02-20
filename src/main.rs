@@ -11,7 +11,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 use std::collections::HashSet;
@@ -76,6 +77,35 @@ fn main() -> glib::ExitCode {
 /// Usage:
 ///   kosmokopy --cli [OPTIONS]
 ///
+/// Helper to emit CLI JSON result and return an exit code.
+fn cli_output_json(
+    status: &str,
+    copied: usize,
+    skipped: &[String],
+    excluded_files: usize,
+    excluded_dirs: usize,
+    errors: &[String],
+) -> i32 {
+    let skipped_json: Vec<String> = skipped
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let errors_json: Vec<String> = errors
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    println!(
+        "{{\"status\":\"{}\",\"copied\":{},\"skipped\":[{}],\"excluded_files\":{},\"excluded_dirs\":{},\"errors\":[{}]}}",
+        status,
+        copied,
+        skipped_json.join(","),
+        excluded_files,
+        excluded_dirs,
+        errors_json.join(","),
+    );
+    if !errors.is_empty() { 2 } else { 0 }
+}
+
 /// Required:
 ///   --src <path|host:/path>      Source directory or remote
 ///   --dst <path|host:/path>      Destination directory or remote
@@ -187,6 +217,16 @@ fn run_cli(args: &[String]) -> i32 {
     };
 
     let (tx, rx) = mpsc::channel::<WorkerMsg>();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // Handle Ctrl+C gracefully in CLI mode
+    {
+        let cancel_flag_c = cancel_flag.clone();
+        let _ = ctrlc::set_handler(move || {
+            cancel_flag_c.store(true, Ordering::SeqCst);
+            eprintln!("\nCancelling…");
+        });
+    }
 
     let src_is_remote = matches!(&source_sel, SourceSelection::Remote(_, _));
     let (dst_host, dest_path) = parse_destination(&dst);
@@ -196,7 +236,7 @@ fn run_cli(args: &[String]) -> i32 {
             if let SourceSelection::Remote(shost, spath) = &source_sel {
                 run_remote_to_remote_worker(
                     shost, spath, &dhost, &dest_path, do_move, conflict_mode,
-                    strip_spaces, transfer_mode, &patterns, tx,
+                    strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
                 );
             }
         }
@@ -204,7 +244,7 @@ fn run_cli(args: &[String]) -> i32 {
             if let SourceSelection::Remote(shost, spath) = &source_sel {
                 run_remote_to_remote_rsync_worker(
                     shost, spath, &dhost, &dest_path, do_move, conflict_mode,
-                    strip_spaces, transfer_mode, &patterns, tx,
+                    strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
                 );
             }
         }
@@ -212,25 +252,25 @@ fn run_cli(args: &[String]) -> i32 {
             if let SourceSelection::Remote(shost, spath) = &source_sel {
                 run_remote_to_local_worker(
                     shost, spath, &dest_path, do_move, conflict_mode,
-                    strip_spaces, transfer_mode, &patterns, method, tx,
+                    strip_spaces, transfer_mode, &patterns, method, cancel_flag.clone(), tx,
                 );
             }
         }
         (false, Some(host), TransferMethod::Standard) => run_remote_worker(
             source_sel, &host, &dest_path, do_move, conflict_mode,
-            strip_spaces, transfer_mode, &patterns, tx,
+            strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
         ),
         (false, Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
             source_sel, &host, &dest_path, do_move, conflict_mode,
-            strip_spaces, transfer_mode, &patterns, tx,
+            strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
         ),
         (false, None, TransferMethod::Rsync) => run_local_rsync_worker(
             source_sel, dest_path, do_move, conflict_mode,
-            strip_spaces, transfer_mode, &patterns, tx,
+            strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
         ),
         (false, None, TransferMethod::Standard) => run_worker(
             source_sel, dest_path, do_move, conflict_mode,
-            strip_spaces, transfer_mode, &patterns, tx,
+            strip_spaces, transfer_mode, &patterns, cancel_flag.clone(), tx,
         ),
     }
 
@@ -238,22 +278,10 @@ fn run_cli(args: &[String]) -> i32 {
     for msg in rx {
         match msg {
             WorkerMsg::Finished { copied, skipped, excluded_files, excluded_dirs, errors } => {
-                // Output JSON result
-                let skipped_json: Vec<String> = skipped.iter()
-                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-                    .collect();
-                let errors_json: Vec<String> = errors.iter()
-                    .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-                    .collect();
-                println!(
-                    "{{\"status\":\"finished\",\"copied\":{},\"skipped\":[{}],\"excluded_files\":{},\"excluded_dirs\":{},\"errors\":[{}]}}",
-                    copied,
-                    skipped_json.join(","),
-                    excluded_files,
-                    excluded_dirs,
-                    errors_json.join(","),
-                );
-                return if errors.is_empty() { 0 } else { 2 };
+                return cli_output_json("finished", copied, &skipped, excluded_files, excluded_dirs, &errors);
+            }
+            WorkerMsg::Cancelled { copied, skipped, excluded_files, excluded_dirs, errors } => {
+                return cli_output_json("cancelled", copied, &skipped, excluded_files, excluded_dirs, &errors);
             }
             WorkerMsg::Error(e) => {
                 let escaped = e.replace('\\', "\\\\").replace('"', "\\\"");
@@ -279,6 +307,13 @@ enum WorkerMsg {
         file: String,
     },
     Finished {
+        copied: usize,
+        skipped: Vec<String>,
+        excluded_files: usize,
+        excluded_dirs: usize,
+        errors: Vec<String>,
+    },
+    Cancelled {
         copied: usize,
         skipped: Vec<String>,
         excluded_files: usize,
@@ -459,6 +494,12 @@ fn build_ui(app: &Application) {
     let btn_start = Button::with_label("Transfer");
     btn_start.add_css_class("suggested-action");
     root.append(&btn_start);
+
+    // ── Cancel button (hidden until a transfer is running) ────────────
+    let btn_cancel = Button::with_label("Cancel");
+    btn_cancel.add_css_class("destructive-action");
+    btn_cancel.set_visible(false);
+    root.append(&btn_cancel);
 
     window.set_child(Some(&root));
 
@@ -694,6 +735,7 @@ fn build_ui(app: &Application) {
         let progress_bar = progress_bar.clone();
         let status_label = status_label.clone();
         let btn_start = btn_start.clone();
+        let btn_cancel = btn_cancel.clone();
         let running = running.clone();
         let window = window.clone();
 
@@ -761,15 +803,31 @@ fn build_ui(app: &Application) {
 
             *running.borrow_mut() = true;
             btn_start.set_sensitive(false);
+            btn_cancel.set_visible(true);
             progress_bar.set_fraction(0.0);
             progress_bar.set_text(Some("Scanning…"));
             status_label.set_text("");
+
+            // Cancel flag shared between UI and worker thread
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+
+            // Wire Cancel button
+            {
+                let cancel_flag_c = cancel_flag.clone();
+                let btn_cancel_c = btn_cancel.clone();
+                btn_cancel_c.connect_clicked(move |btn| {
+                    cancel_flag_c.store(true, Ordering::SeqCst);
+                    btn.set_sensitive(false);
+                    btn.set_label("Cancelling…");
+                });
+            }
 
             // Channel for worker → UI communication
             let (tx, rx) = mpsc::channel::<WorkerMsg>();
 
             // Spawn worker thread
             let dst_clone = dst.clone();
+            let cancel_flag_w = cancel_flag.clone();
             thread::spawn(move || {
                 let (dst_host, dest_path) = parse_destination(&dst_clone);
                 let src_is_remote = matches!(&source_sel, SourceSelection::Remote(_, _));
@@ -779,7 +837,7 @@ fn build_ui(app: &Application) {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_remote_worker(
                                 shost, &spath, &dhost, &dest_path, do_move, conflict_mode,
-                                strip_spaces, transfer_mode, &patterns, tx,
+                                strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                             );
                         }
                     }
@@ -787,7 +845,7 @@ fn build_ui(app: &Application) {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_remote_rsync_worker(
                                 shost, &spath, &dhost, &dest_path, do_move, conflict_mode,
-                                strip_spaces, transfer_mode, &patterns, tx,
+                                strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                             );
                         }
                     }
@@ -796,27 +854,27 @@ fn build_ui(app: &Application) {
                         if let SourceSelection::Remote(shost, spath) = &source_sel {
                             run_remote_to_local_worker(
                                 shost, &spath, &dest_path, do_move, conflict_mode,
-                                strip_spaces, transfer_mode, &patterns, transfer_method, tx,
+                                strip_spaces, transfer_mode, &patterns, transfer_method, cancel_flag_w, tx,
                             );
                         }
                     }
                     // Local source → remote destination
                     (false, Some(host), TransferMethod::Standard) => run_remote_worker(
                         source_sel, &host, &dest_path, do_move, conflict_mode,
-                        strip_spaces, transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                     ),
                     (false, Some(host), TransferMethod::Rsync) => run_remote_rsync_worker(
                         source_sel, &host, &dest_path, do_move, conflict_mode,
-                        strip_spaces, transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                     ),
                     // Local source → local destination
                     (false, None, TransferMethod::Rsync) => run_local_rsync_worker(
                         source_sel, dest_path, do_move, conflict_mode,
-                        strip_spaces, transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                     ),
                     (false, None, TransferMethod::Standard) => run_worker(
                         source_sel, dest_path, do_move, conflict_mode,
-                        strip_spaces, transfer_mode, &patterns, tx,
+                        strip_spaces, transfer_mode, &patterns, cancel_flag_w, tx,
                     ),
                 }
             });
@@ -825,6 +883,7 @@ fn build_ui(app: &Application) {
             let progress_bar_c = progress_bar.clone();
             let status_label_c = status_label.clone();
             let btn_start_c = btn_start.clone();
+            let btn_cancel_c = btn_cancel.clone();
             let window_c = window.clone();
             let running_c = running.clone();
 
@@ -873,6 +932,9 @@ fn build_ui(app: &Application) {
                             progress_bar_c.set_text(Some("Complete"));
                             status_label_c.set_text(&summary);
                             btn_start_c.set_sensitive(true);
+                            btn_cancel_c.set_visible(false);
+                            btn_cancel_c.set_sensitive(true);
+                            btn_cancel_c.set_label("Cancel");
                             *running_c.borrow_mut() = false;
 
                             let title = if errors.is_empty() && skipped.is_empty() {
@@ -902,9 +964,57 @@ fn build_ui(app: &Application) {
                             progress_bar_c.set_text(Some("Error"));
                             status_label_c.set_text(&e);
                             btn_start_c.set_sensitive(true);
+                            btn_cancel_c.set_visible(false);
+                            btn_cancel_c.set_sensitive(true);
+                            btn_cancel_c.set_label("Cancel");
                             *running_c.borrow_mut() = false;
 
                             show_result_dialog(&window_c, "Error", &e, &[]);
+
+                            return glib::ControlFlow::Break;
+                        }
+                        WorkerMsg::Cancelled {
+                            copied,
+                            skipped,
+                            excluded_files,
+                            excluded_dirs,
+                            errors,
+                        } => {
+                            let verb = if do_move { "Moved" } else { "Copied" };
+                            let mut excl_parts = Vec::new();
+                            if excluded_files > 0 {
+                                excl_parts.push(format!("{} file(s)", excluded_files));
+                            }
+                            if excluded_dirs > 0 {
+                                excl_parts.push(format!("{} dir(s)", excluded_dirs));
+                            }
+                            let excl_str = if excl_parts.is_empty() {
+                                "0".to_string()
+                            } else {
+                                excl_parts.join(", ")
+                            };
+                            let summary = format!(
+                                "Cancelled. {} {} file(s) before stopping, {} skipped, {} excluded.",
+                                verb, copied, skipped.len(), excl_str
+                            );
+                            progress_bar_c.set_text(Some("Cancelled"));
+                            status_label_c.set_text(&summary);
+                            btn_start_c.set_sensitive(true);
+                            btn_cancel_c.set_visible(false);
+                            btn_cancel_c.set_sensitive(true);
+                            btn_cancel_c.set_label("Cancel");
+                            *running_c.borrow_mut() = false;
+
+                            let mut all_notes = Vec::new();
+                            if !skipped.is_empty() {
+                                all_notes.push(format!("Skipped ({}):", skipped.len()));
+                                all_notes.extend(skipped);
+                            }
+                            if !errors.is_empty() {
+                                all_notes.push(format!("Errors ({}):", errors.len()));
+                                all_notes.extend(errors);
+                            }
+                            show_result_dialog(&window_c, "Cancelled", &summary, &all_notes);
 
                             return glib::ControlFlow::Break;
                         }
@@ -1259,6 +1369,7 @@ fn run_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let dst_path = PathBuf::from(&dst);
@@ -1306,6 +1417,16 @@ fn run_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, file_path) in files.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         // Build destination path based on source type and transfer mode
         let dest_file = match (&src_dir, transfer_mode) {
             // Directory source + "Folders and files": preserve directory structure
@@ -1475,6 +1596,7 @@ fn run_local_rsync_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let dst_path = PathBuf::from(&dst);
@@ -1532,6 +1654,16 @@ fn run_local_rsync_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, file_path) in files.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         // Build destination path
         let dest_file = match (&src_dir, transfer_mode) {
             (Some(sd), TransferMode::FoldersAndFiles) => match file_path.strip_prefix(sd) {
@@ -1731,6 +1863,7 @@ fn run_remote_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     // SSH control-socket args — reuses a single TCP connection for all calls
@@ -1867,6 +2000,16 @@ fn run_remote_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (local, remote)) in transfers.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         // Handle conflict if file exists remotely
         let remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(remote) {
             match conflict_mode {
@@ -2060,7 +2203,12 @@ fn collect_remote_files(
         let rel = if let Some(stripped) = line.strip_prefix(&remote_base_slash) {
             stripped
         } else if line == remote_base {
-            continue;
+            // The remote path is a single file, not a directory.
+            // Use just the filename as the relative path.
+            match Path::new(line).file_name() {
+                Some(name) => name.to_str().unwrap_or(line),
+                None => continue,
+            }
         } else {
             continue;
         };
@@ -2110,6 +2258,7 @@ fn run_remote_to_local_worker(
     transfer_mode: TransferMode,
     patterns: &[String],
     transfer_method: TransferMethod,
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let ctl = [
@@ -2179,6 +2328,16 @@ fn run_remote_to_local_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, remote_file) in remote_files.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         let rel = remote_file
             .strip_prefix(&src_base_slash)
             .unwrap_or(remote_file);
@@ -2331,6 +2490,7 @@ fn run_remote_to_remote_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let ctl = [
@@ -2476,6 +2636,16 @@ fn run_remote_to_remote_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         // Handle conflict if destination exists
         let dst_remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(dst_remote) {
             match conflict_mode {
@@ -2651,6 +2821,7 @@ fn run_remote_to_remote_rsync_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     let ctl = [
@@ -2804,6 +2975,16 @@ fn run_remote_to_remote_rsync_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (src_remote, dst_remote, local_temp)) in transfers.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         let dst_remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(dst_remote) {
             match conflict_mode {
                 ConflictMode::Skip => {
@@ -3045,6 +3226,7 @@ fn run_remote_rsync_worker(
     strip_spaces: bool,
     transfer_mode: TransferMode,
     patterns: &[String],
+    cancel_flag: Arc<AtomicBool>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
     // SSH options — reused for direct ssh calls and passed to rsync via -e
@@ -3205,6 +3387,16 @@ fn run_remote_rsync_worker(
     let mut errors: Vec<String> = Vec::new();
 
     for (i, (local, remote)) in transfers.iter().enumerate() {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tx.send(WorkerMsg::Cancelled {
+                copied,
+                skipped,
+                excluded_files,
+                excluded_dirs,
+                errors,
+            });
+            return;
+        }
         // Handle conflict if file exists remotely
         let remote = if conflict_mode != ConflictMode::Overwrite && existing.contains(remote) {
             match conflict_mode {

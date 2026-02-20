@@ -107,6 +107,8 @@ Transfer files to or from remote machines, or between two remote machines, using
 ### Progress and Reporting
 
 - Real-time progress bar showing file count and current filename
+- **Cancel button** — gracefully stop a running transfer at the next file boundary; already-copied files are kept, the remaining files are skipped, and a summary is shown
+- In CLI mode, press **Ctrl+C** to cancel; the JSON output reports `"status":"cancelled"` with counts of files transferred before stopping
 - Completion dialog with summary of copied, skipped, and excluded files
 - Detailed skip reasons (identical, already exists, different version)
 - Scrollable error list if any transfers fail
@@ -281,6 +283,8 @@ Output is a single JSON line:
 {"status":"finished","copied":3,"skipped":[],"excluded_files":0,"excluded_dirs":0,"errors":[]}
 ```
 
+If cancelled via Ctrl+C, the status is `"cancelled"` and counts reflect work done before stopping.
+
 ### Running the Tests
 
 **Prerequisites:** Python 3.9+, pipenv, pytest
@@ -350,6 +354,8 @@ All third-party dependency licenses (MIT, Apache-2.0, Unlicense) are bundled in 
 
 ### 2026-02-20
 
+- **Added Cancel button** — a "Cancel" button appears during transfers in the GUI; clicking it gracefully stops the transfer at the next file boundary, keeps already-copied files, and shows a summary dialog; in CLI mode, pressing Ctrl+C sends a cancellation signal with the same graceful behaviour
+- **Fixed remote single-file copy** — copying a single file from a remote source now works correctly (previously returned 0 files because `collect_remote_files` skipped the sole entry)
 - **Added `--cli` headless mode** — run all transfer operations from the command line without opening a GTK window; accepts `--src`, `--dst`, `--move`, `--conflict`, `--strip-spaces`, `--mode`, `--method`, `--exclude` and prints a JSON result
 - **Rewrote test suite to use the real binary** — all 106 tests now invoke `kosmokopy --cli` via subprocess; Python only verifies results (file existence, SHA-256 hashes, source deletion)
 - **Added 30 negative/corruption tests** — deliberately tamper with copied files (single-byte flip, append, truncate, replace, delete, empty↔nonempty) and verify that SHA-256 and byte-comparison checks catch every corruption; covers local standard, rsync, move, flat mode, strip-spaces, remote upload, and remote download scenarios; includes hash-helper self-tests
