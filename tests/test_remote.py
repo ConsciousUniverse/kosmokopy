@@ -498,7 +498,7 @@ class TestRemoteConflicts:
 
         # Both should exist
         assert remote_file_exists(host, rdir + "/src/file.txt")
-        assert remote_file_exists(host, rdir + "/src/file (1).txt")
+        assert remote_file_exists(host, rdir + "/src/file_1.txt")
 
 
 # ═══════════════════════════════════════════════════════════════════════

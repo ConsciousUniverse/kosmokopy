@@ -107,22 +107,22 @@ class TestConflictRenameLocal:
         # Original untouched
         assert (root / "hello.txt").read_text() == "EXISTING\n"
         # Renamed copy created
-        assert (root / "hello (1).txt").exists()
-        assert (root / "hello (1).txt").read_text() == (tmp_src / "hello.txt").read_text()
+        assert (root / "hello_1.txt").exists()
+        assert (root / "hello_1.txt").read_text() == (tmp_src / "hello.txt").read_text()
 
     def test_rename_increments(self, tmp_src, tmp_dst):
         """Multiple pre-existing files increment the counter."""
         root = tmp_dst / tmp_src.name
         root.mkdir(parents=True, exist_ok=True)
         (root / "hello.txt").write_text("original\n")
-        (root / "hello (1).txt").write_text("first\n")
-        (root / "hello (2).txt").write_text("second\n")
+        (root / "hello_1.txt").write_text("first\n")
+        (root / "hello_2.txt").write_text("second\n")
 
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, conflict="rename")
         assert result["status"] == "finished"
 
-        assert (root / "hello (3).txt").exists()
-        assert (root / "hello (3).txt").read_text() == (tmp_src / "hello.txt").read_text()
+        assert (root / "hello_3.txt").exists()
+        assert (root / "hello_3.txt").read_text() == (tmp_src / "hello.txt").read_text()
 
     def test_rename_preserves_extension(self, tmp_src, tmp_dst):
         root = tmp_dst / tmp_src.name
@@ -132,8 +132,8 @@ class TestConflictRenameLocal:
         result = run_kosmokopy(src=tmp_src, dst=tmp_dst, conflict="rename")
         assert result["status"] == "finished"
 
-        assert (root / "data (1).bin").exists()
-        assert sha256_of_file(tmp_src / "data.bin") == sha256_of_file(root / "data (1).bin")
+        assert (root / "data_1.bin").exists()
+        assert sha256_of_file(tmp_src / "data.bin") == sha256_of_file(root / "data_1.bin")
 
     def test_rename_no_extension(self, tmp_path):
         """Rename works for files with no extension."""
@@ -151,8 +151,8 @@ class TestConflictRenameLocal:
         assert result["status"] == "finished"
 
         assert (root / "Makefile").read_text() == "old\n"
-        assert (root / "Makefile (1)").exists()
-        assert (root / "Makefile (1)").read_text() == "new\n"
+        assert (root / "Makefile_1").exists()
+        assert (root / "Makefile_1").read_text() == "new\n"
 
     def test_rename_move_mode(self, tmp_src, tmp_dst):
         """Rename + move: source deleted, renamed copy at dest."""
@@ -167,7 +167,45 @@ class TestConflictRenameLocal:
 
         assert not src_hello.exists()
         assert (root / "hello.txt").read_text() == "EXISTING\n"
-        assert (root / "hello (1).txt").read_text() == original_content
+        assert (root / "hello_1.txt").read_text() == original_content
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Local conflict: Rename (rsync)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestConflictRenameLocalRsync:
+
+    def test_rename_rsync_creates_numbered_copy(self, tmp_src, tmp_dst):
+        root = tmp_dst / tmp_src.name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "hello.txt").write_text("EXISTING\n")
+
+        result = run_kosmokopy(src=tmp_src, dst=tmp_dst, conflict="rename", method="rsync")
+        assert result["status"] == "finished"
+        assert result["errors"] == []
+
+        # Original untouched
+        assert (root / "hello.txt").read_text() == "EXISTING\n"
+        # Renamed copy created
+        assert (root / "hello_1.txt").exists()
+        assert (root / "hello_1.txt").read_text() == (tmp_src / "hello.txt").read_text()
+
+    def test_rename_rsync_move_mode(self, tmp_src, tmp_dst):
+        """Rename + move via rsync: source deleted, renamed copy at dest."""
+        root = tmp_dst / tmp_src.name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "hello.txt").write_text("EXISTING\n")
+        src_hello = tmp_src / "hello.txt"
+        original_content = src_hello.read_text()
+
+        result = run_kosmokopy(src=tmp_src, dst=tmp_dst, conflict="rename", move=True, method="rsync")
+        assert result["status"] == "finished"
+
+        assert not src_hello.exists()
+        assert (root / "hello.txt").read_text() == "EXISTING\n"
+        assert (root / "hello_1.txt").read_text() == original_content
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,4 +275,76 @@ class TestConflictRenameRemote:
         files = remote_ls(host, rdir)
         names = {Path(f).name for f in files}
         assert "hello.txt" in names
-        assert "hello (1).txt" in names
+        assert "hello_1.txt" in names
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Remote conflict modes (rsync)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@requires_remote
+class TestConflictSkipRemoteRsync:
+
+    def test_skip_existing_remote_rsync(self, tmp_src, remote_dest):
+        host, rdir = remote_dest
+
+        # First upload via rsync
+        result = run_kosmokopy(src=tmp_src, dst="{}:{}".format(host, rdir), method="rsync")
+        assert result["status"] == "finished"
+        assert result["copied"] == 6
+
+        # Second upload with skip — all should be skipped
+        result = run_kosmokopy(
+            src=tmp_src, dst="{}:{}".format(host, rdir), conflict="skip", method="rsync",
+        )
+        assert result["status"] == "finished"
+        assert len(result["skipped"]) == 6
+        assert result["copied"] == 0
+
+
+@requires_remote
+class TestConflictOverwriteRemoteRsync:
+
+    def test_overwrite_replaces_remote_rsync(self, tmp_path, remote_dest):
+        host, rdir = remote_dest
+
+        # Upload initial content via rsync
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "file.txt").write_text("OLD\n")
+        run_kosmokopy(src=src, dst="{}:{}".format(host, rdir), method="rsync")
+
+        # Upload different content with overwrite via rsync
+        (src / "file.txt").write_text("NEW\n")
+        result = run_kosmokopy(
+            src=src, dst="{}:{}".format(host, rdir), conflict="overwrite", method="rsync",
+        )
+        assert result["status"] == "finished"
+        assert result["copied"] == 1
+
+        assert sha256_remote(host, rdir + "/src/file.txt") == sha256_of_file(src / "file.txt")
+
+
+@requires_remote
+class TestConflictRenameRemoteRsync:
+
+    def test_rename_remote_rsync(self, tmp_src, remote_dest):
+        host, rdir = remote_dest
+
+        # First upload via rsync
+        run_kosmokopy(src=tmp_src, dst="{}:{}".format(host, rdir), method="rsync")
+
+        # Second upload with rename via rsync
+        result = run_kosmokopy(
+            src=tmp_src, dst="{}:{}".format(host, rdir), conflict="rename", method="rsync",
+        )
+        assert result["status"] == "finished"
+        assert result["copied"] == 6
+        assert result["errors"] == []
+
+        # Both original and renamed files should exist
+        files = remote_ls(host, rdir)
+        names = {Path(f).name for f in files}
+        assert "hello.txt" in names
+        assert "hello_1.txt" in names

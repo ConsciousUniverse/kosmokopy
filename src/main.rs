@@ -1394,7 +1394,6 @@ fn show_remote_browser(
             let btn_select_c = btn_select.clone();
             let path_entry_c = path_entry.clone();
             let selected_path_c = selected_path.clone();
-            let select_dirs_only_c = select_dirs_only;
             glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
                 match rx.try_recv() {
                     Ok((resolved_path, result)) => {
@@ -1440,11 +1439,12 @@ fn show_remote_browser(
                                     file_count,
                                 ));
 
-                                if select_dirs_only_c {
-                                    btn_select_c.set_sensitive(true);
-                                    *selected_path_c.borrow_mut() =
-                                        Some(path_entry_c.text().to_string());
-                                }
+                                // Always allow selecting the current directory
+                                // (for source browse this selects the folder as source;
+                                //  for destination browse this selects the folder as target).
+                                btn_select_c.set_sensitive(true);
+                                *selected_path_c.borrow_mut() =
+                                    Some(path_entry_c.text().to_string());
                             }
                             Err(e) => {
                                 status_c.set_text(&format!("Error: {}", e));
@@ -1725,14 +1725,35 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Find a unique local path by appending " (1)", " (2)", etc. before the extension.
+/// Escape a remote path for rsync's `host:path` syntax.
+///
+/// rsync passes the path portion of `host:path` through the remote shell,
+/// so characters like spaces, parentheses, and other shell metacharacters
+/// must be backslash-escaped.  This avoids needing `--protect-args` which
+/// is not supported by macOS's bundled openrsync.
+fn rsync_escape_remote(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 16);
+    for ch in path.chars() {
+        match ch {
+            ' ' | '(' | ')' | '\'' | '"' | '&' | ';' | '|' | '$' | '`'
+            | '!' | '#' | '*' | '?' | '[' | ']' | '{' | '}' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Find a unique local path by appending "_1", "_2", etc. before the extension.
 fn find_unique_local_path(original: &Path) -> PathBuf {
     let parent = original.parent().unwrap_or_else(|| Path::new("."));
     let stem = original.file_stem().unwrap_or_default().to_string_lossy().to_string();
     let ext = original.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let mut n = 1u32;
     loop {
-        let candidate = parent.join(format!("{} ({}){}", stem, n, ext));
+        let candidate = parent.join(format!("{}_{}{}", stem, n, ext));
         if !candidate.exists() {
             return candidate;
         }
@@ -1740,7 +1761,7 @@ fn find_unique_local_path(original: &Path) -> PathBuf {
     }
 }
 
-/// Find a unique remote path by appending " (1)", " (2)", etc. before the extension.
+/// Find a unique remote path by appending "_1", "_2", etc. before the extension.
 /// Checks existence via SSH.
 #[allow(dead_code)]
 fn find_unique_remote_path(
@@ -1754,7 +1775,7 @@ fn find_unique_remote_path(
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let mut n = 1u32;
     loop {
-        let candidate = format!("{}/{} ({}){}", parent, stem, n, ext);
+        let candidate = format!("{}/{}_{}{}", parent, stem, n, ext);
         let check = Command::new("ssh")
             .args(ctl)
             .arg(host)
@@ -1781,7 +1802,7 @@ fn find_unique_remote_path_from_set(
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
     let mut n = 1u32;
     loop {
-        let candidate = format!("{}/{} ({}){}", parent, stem, n, ext);
+        let candidate = format!("{}/{}_{}{}", parent, stem, n, ext);
         if !existing.contains(&candidate) {
             return candidate;
         }
@@ -2969,7 +2990,7 @@ fn run_remote_to_local_worker(
                     .args(["-az", "--checksum"])
                     .arg("-e")
                     .arg(ssh_cmd)
-                    .arg(format!("{}:{}", src_host, remote_file))
+                    .arg(format!("{}:{}", src_host, rsync_escape_remote(remote_file)))
                     .arg(&local_dest)
                     .status();
                 matches!(result, Ok(s) if s.success())
@@ -3594,7 +3615,7 @@ fn run_remote_to_remote_rsync_worker(
             .args(["-az", "--checksum"])
             .arg("-e")
             .arg(ssh_cmd)
-            .arg(format!("{}:{}", src_host, src_remote))
+            .arg(format!("{}:{}", src_host, rsync_escape_remote(src_remote)))
             .arg(local_temp)
             .status();
         if !matches!(dl_result, Ok(s) if s.success()) {
@@ -3644,7 +3665,7 @@ fn run_remote_to_remote_rsync_worker(
             .arg("-e")
             .arg(ssh_cmd)
             .arg(local_temp)
-            .arg(format!("{}:{}", dst_host, dst_remote))
+            .arg(format!("{}:{}", dst_host, rsync_escape_remote(&dst_remote)))
             .status();
         if !matches!(ul_result, Ok(s) if s.success()) {
             let _ = fs::remove_file(local_temp);
@@ -4008,7 +4029,7 @@ fn run_remote_rsync_worker(
             .arg("-e")
             .arg(ssh_cmd)
             .arg(local)
-            .arg(format!("{}:{}", host, remote))
+            .arg(format!("{}:{}", host, rsync_escape_remote(&remote)))
             .status();
 
         match rsync_result {
