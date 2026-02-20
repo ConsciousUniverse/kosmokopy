@@ -4,7 +4,9 @@ A GTK4 file copier and mover with filtering, integrity verification, and SSH rem
 
 This application was 'vibe coded' using Claude Opus 4.6.
 
-IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the provided test suite; and in 'production' on my own systems), but file corruption and complete destruction of your data cannot be guaranteed! TEST AT YOUR OWN RISK!
+IMPORTANT: This is an ALPHA VERSION. It has been tested (manually; through the provided test suite; and in 'production' on my own systems), but file corruption cannot be guaranteed and your data may be completely destroyed. TEST AT YOUR OWN RISK.
+
+Binaries for Linux and MacOS are available on the [releases page](https://github.com/ConsciousUniverse/kosmokopy/releases) (expand the 'assets' section).
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange) ![GTK4](https://img.shields.io/badge/GTK4-0.9-blue)
 
@@ -65,10 +67,10 @@ The **Browse Remote** buttons (available on both source and destination rows) op
 
 When a file already exists at the destination, Kosmokopy offers three strategies selected via the `--conflict` flag (CLI) or radio buttons (GUI):
 
-| Destination file  | Content         | Skip mode                         | Overwrite mode                | Rename mode                                    |
-| ----------------- | --------------- | --------------------------------- | ----------------------------- | ---------------------------------------------- |
-| Doesn't exist     | —              | Copy/move normally                | Copy/move normally            | Copy/move normally                             |
-| Exists, identical | Same bytes      | Skip ("identical at destination") | Skip (identical)              | Skip (identical)                               |
+| Destination file  | Content         | Skip mode                         | Overwrite mode                | Rename mode                                  |
+| ----------------- | --------------- | --------------------------------- | ----------------------------- | -------------------------------------------- |
+| Doesn't exist     | —              | Copy/move normally                | Copy/move normally            | Copy/move normally                           |
+| Exists, identical | Same bytes      | Skip ("identical at destination") | Skip (identical)              | Skip (identical)                             |
 | Exists, different | Different bytes | Skip ("already exists")           | Overwrite with source version | Keep original, save source as `file_1.ext` |
 
 In **Move** mode, the source file is deleted after a successful transfer (or immediately if the destination is already identical). In **Rename** mode, the counter increments (`file_1.ext`, `file_2.ext`, …) until an unused name is found.
@@ -239,7 +241,7 @@ Kosmokopy includes an external Python test suite that exercises the real Rust bi
 | Test file              | What it covers                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `test_local.py`      | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation, single-file copy/move                                                                                                                                                                                                                                                    |
-| `test_conflicts.py`  | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `_1`, `_2`, … auto-rename numbering scheme                                                                                                                                                                                                                              |
+| `test_conflicts.py`  | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `_1`, `_2`, … auto-rename numbering scheme                                                                                                                                                                                                                                |
 | `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching                                                                                                                                                                                                                                             |
 | `test_integrity.py`  | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity,**plus 30 negative/corruption tests** — single-byte flip, appended byte, truncation, content replacement, file deletion, empty↔nonempty swap, nested corruption, remote corruption (append/truncate/replace/delete), and hash-helper self-tests |
 | `test_remote.py`     | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, single-file remote upload/download, real source directory upload                                                                                                                                            |
