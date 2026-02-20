@@ -1190,9 +1190,10 @@ fn list_remote_dir(host: &str, path: &str) -> Result<Vec<RemoteEntry>, String> {
         "-o", "ControlPersist=60",
         "-o", "ConnectTimeout=10",
     ];
+    let clean_path = if path == "/" { "/".to_string() } else { path.trim_end_matches('/').to_string() };
     let cmd = format!(
         "ls -1apL {} 2>/dev/null",
-        shell_quote(path.trim_end_matches('/')),
+        shell_quote(&clean_path),
     );
     let out = Command::new("ssh")
         .args(&ctl)
