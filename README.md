@@ -8,7 +8,7 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 ## Screenshot
 
-![1771527443790](image/README/1771527443790.png)
+![1771546472010](image/README/1771546472010.png)
 
 ## Features
 
@@ -49,11 +49,11 @@ IMPORTANT: This is an ALPHA VERSION. It may corrupt files and completely destroy
 
 When a file already exists at the destination, Kosmokopy offers three strategies selected via the `--conflict` flag (CLI) or radio buttons (GUI):
 
-| Destination file  | Content        | Skip mode                          | Overwrite mode                    | Rename mode                              |
-| ----------------- | -------------- | ---------------------------------- | --------------------------------- | ---------------------------------------- |
-| Doesn't exist     | —              | Copy/move normally                 | Copy/move normally                | Copy/move normally                       |
-| Exists, identical | Same bytes     | Skip ("identical at destination")  | Skip (identical)                  | Skip (identical)                         |
-| Exists, different | Different bytes | Skip ("already exists")           | Overwrite with source version     | Keep original, save source as `file (1).ext` |
+| Destination file  | Content         | Skip mode                         | Overwrite mode                | Rename mode                                    |
+| ----------------- | --------------- | --------------------------------- | ----------------------------- | ---------------------------------------------- |
+| Doesn't exist     | —              | Copy/move normally                | Copy/move normally            | Copy/move normally                             |
+| Exists, identical | Same bytes      | Skip ("identical at destination") | Skip (identical)              | Skip (identical)                               |
+| Exists, different | Different bytes | Skip ("already exists")           | Overwrite with source version | Keep original, save source as `file (1).ext` |
 
 In **Move** mode, the source file is deleted after a successful transfer (or immediately if the destination is already identical). In **Rename** mode, the counter increments (`file (1).ext`, `file (2).ext`, …) until an unused name is found.
 
@@ -182,12 +182,12 @@ Creates a portable `target/appimage/Kosmokopy-0.1.0-x86_64.AppImage`.
 
 ### Transfer Scenarios
 
-| Source | Destination | How it works |
-|--------|-------------|-------------|
-| Local folder/files | Local path | Direct file copy/move with byte-by-byte verification |
-| Local folder/files | `host:/path` | Upload via SCP or rsync with SHA-256 verification |
-| `host:/path` | Local path | Download via SCP or rsync with SHA-256 verification |
-| `host1:/path` | `host2:/path` | Download to local temp → verify → upload to dest → verify → clean up |
+| Source             | Destination     | How it works                                                             |
+| ------------------ | --------------- | ------------------------------------------------------------------------ |
+| Local folder/files | Local path      | Direct file copy/move with byte-by-byte verification                     |
+| Local folder/files | `host:/path`  | Upload via SCP or rsync with SHA-256 verification                        |
+| `host:/path`     | Local path      | Download via SCP or rsync with SHA-256 verification                      |
+| `host1:/path`    | `host2:/path` | Download to local temp → verify → upload to dest → verify → clean up |
 
 ## Test Suite
 
@@ -195,13 +195,13 @@ Kosmokopy includes an external Python test suite that exercises the real Rust bi
 
 ### What It Tests
 
-| Test file | What it covers |
-|-----------|---------------|
-| `test_local.py` | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation |
-| `test_conflicts.py` | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `(1)`, `(2)`, … auto-rename numbering scheme |
-| `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching |
-| `test_integrity.py` | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity, **plus 30 negative/corruption tests** — single-byte flip, appended byte, truncation, content replacement, file deletion, empty↔nonempty swap, nested corruption, remote corruption (append/truncate/replace/delete), and hash-helper self-tests |
-| `test_remote.py` | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, real source directory upload |
+| Test file              | What it covers                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_local.py`      | Local copy and move (standard + rsync), directory structure preservation, strip-spaces, destination auto-creation                                                                                                                                                                                                                                                                           |
+| `test_conflicts.py`  | All three conflict modes — Skip, Overwrite, Rename — for both local and remote destinations, including the `(1)`, `(2)`, … auto-rename numbering scheme                                                                                                                                                                                                                              |
+| `test_exclusions.py` | Exact directory and file exclusions, wildcard directory and file exclusions (`*`, `?`), combined exclusion rules, case-insensitive matching                                                                                                                                                                                                                                             |
+| `test_integrity.py`  | Byte-by-byte identity after copy, SHA-256 hash verification, empty & large binary files, move-mode source deletion, rsync integrity,**plus 30 negative/corruption tests** — single-byte flip, appended byte, truncation, content replacement, file deletion, empty↔nonempty swap, nested corruption, remote corruption (append/truncate/replace/delete), and hash-helper self-tests |
+| `test_remote.py`     | Local→remote (SCP + rsync), remote→local (SCP + rsync), remote→remote relay (SCP + rsync), move-mode source deletion, conflict handling on remote, exclusions, strip-spaces, real source directory upload                                                                                                                                                                                |
 
 ### How It Works
 
@@ -220,17 +220,17 @@ The integrity test file includes 30 negative tests that prove the verification c
 
 #### Corruption techniques used
 
-| Technique | How it works | What it proves |
-|-----------|-------------|----------------|
-| **Single-byte flip** | XOR one byte at the midpoint with `0xFF` | Detects minimal single-bit corruption |
-| **Appended byte** | Write `\x00` at end of file | Detects extra data appended after transfer |
-| **Truncation** | Rewrite file with only the first half of its content | Detects incomplete or truncated transfers |
-| **Content replacement** | Replace entire file contents with different text of same length | Detects wholesale content substitution |
-| **File deletion** | Remove the destination file entirely | Detects missing files |
-| **Empty → non-empty** | Write data into a previously zero-byte file | Detects corruption of empty files |
-| **Non-empty → empty** | Truncate a file to zero bytes | Detects total data loss |
-| **Nested corruption** | Corrupt files 1 and 2 levels deep in subdirectories | Proves checks work at any directory depth |
-| **Pinpointed corruption** | Corrupt one file among many, verify the rest are still intact | Proves corruption detection is per-file, not global |
+| Technique                       | How it works                                                    | What it proves                                      |
+| ------------------------------- | --------------------------------------------------------------- | --------------------------------------------------- |
+| **Single-byte flip**      | XOR one byte at the midpoint with `0xFF`                      | Detects minimal single-bit corruption               |
+| **Appended byte**         | Write `\x00` at end of file                                   | Detects extra data appended after transfer          |
+| **Truncation**            | Rewrite file with only the first half of its content            | Detects incomplete or truncated transfers           |
+| **Content replacement**   | Replace entire file contents with different text of same length | Detects wholesale content substitution              |
+| **File deletion**         | Remove the destination file entirely                            | Detects missing files                               |
+| **Empty → non-empty**    | Write data into a previously zero-byte file                     | Detects corruption of empty files                   |
+| **Non-empty → empty**    | Truncate a file to zero bytes                                   | Detects total data loss                             |
+| **Nested corruption**     | Corrupt files 1 and 2 levels deep in subdirectories             | Proves checks work at any directory depth           |
+| **Pinpointed corruption** | Corrupt one file among many, verify the rest are still intact   | Proves corruption detection is per-file, not global |
 
 #### Coverage across transfer modes
 
@@ -263,19 +263,20 @@ The `--cli` flag runs the application headlessly (no GTK window). It accepts the
 kosmokopy --cli --src <dir> --dst <dir> [options]
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--src <path>` | Source directory |
-| `--dst <path>` | Destination directory (local or `host:/path`) |
-| `--src-files <a,b,c>` | Comma-separated list of individual source files |
-| `--move` | Move instead of copy |
-| `--conflict <skip\|overwrite\|rename>` | Conflict resolution strategy (default: `skip`) |
-| `--strip-spaces` | Remove spaces from destination filenames and directory names |
-| `--mode <files\|folders>` | Transfer mode (default: `folders`) |
-| `--method <standard\|rsync>` | Transfer method (default: `standard`) |
-| `--exclude <pattern>` | Exclusion pattern (repeatable) |
+| Flag                                   | Description                                                  |
+| -------------------------------------- | ------------------------------------------------------------ |
+| `--src <path>`                       | Source directory                                             |
+| `--dst <path>`                       | Destination directory (local or `host:/path`)              |
+| `--src-files <a,b,c>`                | Comma-separated list of individual source files              |
+| `--move`                             | Move instead of copy                                         |
+| `--conflict <skip\|overwrite\|rename>` | Conflict resolution strategy (default:`skip`)              |
+| `--strip-spaces`                     | Remove spaces from destination filenames and directory names |
+| `--mode <files\|folders>`             | Transfer mode (default:`folders`)                          |
+| `--method <standard\|rsync>`          | Transfer method (default:`standard`)                       |
+| `--exclude <pattern>`                | Exclusion pattern (repeatable)                               |
 
 Output is a single JSON line:
+
 ```json
 {"status":"finished","copied":3,"skipped":[],"excluded_files":0,"excluded_dirs":0,"errors":[]}
 ```
