@@ -1192,7 +1192,7 @@ fn list_remote_dir(host: &str, path: &str) -> Result<Vec<RemoteEntry>, String> {
     ];
     let clean_path = if path == "/" { "/".to_string() } else { path.trim_end_matches('/').to_string() };
     let cmd = format!(
-        "ls -1apL {} 2>/dev/null",
+        "command ls -1apL {} 2>/dev/null",
         shell_quote(&clean_path),
     );
     let out = Command::new("ssh")
