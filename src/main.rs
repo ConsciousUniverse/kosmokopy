@@ -3154,13 +3154,22 @@ fn run_remote_to_remote_worker(
     dst_remote_dirs.insert(dst_base.to_string());
 
     for remote_file in &remote_files {
+        // For single-file sources, strip_prefix fails because
+        // src_base_slash is "<file>/" which doesn't match. Use just
+        // the filename so local_temp stays inside temp_dir.
+        let is_single_file = remote_file.as_str() == src_base;
         let rel = remote_file
             .strip_prefix(&src_base_slash)
-            .unwrap_or(remote_file);
+            .unwrap_or_else(|| {
+                Path::new(remote_file.as_str())
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(remote_file.as_str())
+            });
 
         let dst_rel = match transfer_mode {
             TransferMode::FoldersAndFiles => {
-                if src_root_name.is_empty() { rel.to_string() }
+                if src_root_name.is_empty() || is_single_file { rel.to_string() }
                 else { format!("{}/{}", src_root_name, rel) }
             }
             TransferMode::FilesOnly => {
@@ -3501,13 +3510,22 @@ fn run_remote_to_remote_rsync_worker(
     dst_remote_dirs.insert(dst_base.to_string());
 
     for remote_file in &remote_files {
+        // For single-file sources, strip_prefix fails because
+        // src_base_slash is "<file>/" which doesn't match. Use just
+        // the filename so local_temp stays inside temp_dir.
+        let is_single_file = remote_file.as_str() == src_base;
         let rel = remote_file
             .strip_prefix(&src_base_slash)
-            .unwrap_or(remote_file);
+            .unwrap_or_else(|| {
+                Path::new(remote_file.as_str())
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(remote_file.as_str())
+            });
 
         let dst_rel = match transfer_mode {
             TransferMode::FoldersAndFiles => {
-                if src_root_name.is_empty() { rel.to_string() }
+                if src_root_name.is_empty() || is_single_file { rel.to_string() }
                 else { format!("{}/{}", src_root_name, rel) }
             }
             TransferMode::FilesOnly => {

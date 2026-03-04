@@ -26,6 +26,8 @@ from conftest import (
     _sq,
     REMOTE_HOST,
     REMOTE_PATH,
+    REMOTE_HOST2,
+    REMOTE_PATH2,
 )
 
 
@@ -368,6 +370,94 @@ class TestRemoteToRemoteRsyncRelay:
         assert result["status"] == "finished"
         assert result["errors"] == []
         assert result["copied"] >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Remote → Remote single-file relay (regression: temp dir ENOTSUP)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@requires_remote
+@requires_remote2
+class TestRemoteToRemoteSingleFileSCP:
+    """Transfer a single file between two remote hosts via SCP relay."""
+
+    def test_relay_single_file(self, remote_dest2):
+        if not (REMOTE_HOST and REMOTE_PATH):
+            pytest.skip("Remote host not configured")
+        dst_host, dst_dir = remote_dest2
+
+        # Create a single file on the first remote host
+        src_dir = "{}/r2r_single_scp_{}".format(
+            REMOTE_PATH.rstrip("/"), id(object()),
+        )
+        subprocess.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST, "mkdir -p " + _sq(src_dir)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST,
+             "echo 'r2r single scp' > " + _sq(src_dir + "/one.txt")],
+            check=True, capture_output=True,
+        )
+
+        try:
+            result = run_kosmokopy(
+                src="{}:{}".format(REMOTE_HOST, src_dir),
+                dst="{}:{}".format(dst_host, dst_dir),
+            )
+            assert result["status"] == "finished"
+            assert result["errors"] == []
+            assert result["copied"] == 1
+
+            src_root = Path(src_dir).name
+            src_hash = sha256_remote(REMOTE_HOST, src_dir + "/one.txt")
+            dst_hash = sha256_remote(dst_host, "{}/{}/one.txt".format(dst_dir, src_root))
+            assert src_hash == dst_hash
+        finally:
+            remote_rm_rf(REMOTE_HOST, src_dir)
+
+
+@requires_remote
+@requires_remote2
+@requires_rsync
+class TestRemoteToRemoteSingleFileRsync:
+    """Transfer a single file between two remote hosts via rsync relay."""
+
+    def test_relay_single_file_rsync(self, remote_dest2):
+        if not (REMOTE_HOST and REMOTE_PATH):
+            pytest.skip("Remote host not configured")
+        dst_host, dst_dir = remote_dest2
+
+        src_dir = "{}/r2r_single_rsync_{}".format(
+            REMOTE_PATH.rstrip("/"), id(object()),
+        )
+        subprocess.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST, "mkdir -p " + _sq(src_dir)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ssh"] + SSH_CTL + [REMOTE_HOST,
+             "echo 'r2r single rsync' > " + _sq(src_dir + "/solo.txt")],
+            check=True, capture_output=True,
+        )
+
+        try:
+            result = run_kosmokopy(
+                src="{}:{}".format(REMOTE_HOST, src_dir),
+                dst="{}:{}".format(dst_host, dst_dir),
+                method="rsync",
+            )
+            assert result["status"] == "finished"
+            assert result["errors"] == []
+            assert result["copied"] == 1
+
+            src_root = Path(src_dir).name
+            src_hash = sha256_remote(REMOTE_HOST, src_dir + "/solo.txt")
+            dst_hash = sha256_remote(dst_host, "{}/{}/solo.txt".format(dst_dir, src_root))
+            assert src_hash == dst_hash
+        finally:
+            remote_rm_rf(REMOTE_HOST, src_dir)
 
 
 # ═══════════════════════════════════════════════════════════════════════

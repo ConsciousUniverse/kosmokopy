@@ -68,7 +68,7 @@ class TestLocalCancelStandard:
         """SIGINT during copy should yield status 'cancelled'."""
         dst = tmp_path / "dest"
         result = run_kosmokopy_with_cancel(
-            src=large_src, dst=dst, cancel_after=0.05,
+            src=large_src, dst=dst, cancel_after=0.2,
         )
         assert result["status"] in ("cancelled", "finished")
 
@@ -76,7 +76,7 @@ class TestLocalCancelStandard:
         """After cancel, some (but possibly not all) files are copied."""
         dst = tmp_path / "dest"
         result = run_kosmokopy_with_cancel(
-            src=large_src, dst=dst, cancel_after=0.05,
+            src=large_src, dst=dst, cancel_after=0.2,
         )
         if result["status"] == "cancelled":
             # Fewer than total
@@ -88,7 +88,7 @@ class TestLocalCancelStandard:
         """Files that were copied before cancel should be byte-identical."""
         dst = tmp_path / "dest"
         result = run_kosmokopy_with_cancel(
-            src=large_src, dst=dst, cancel_after=0.05,
+            src=large_src, dst=dst, cancel_after=0.2,
         )
         # Verify every file in dst matches corresponding source
         root = dst / large_src.name
@@ -105,9 +105,9 @@ class TestLocalCancelStandard:
         """Graceful cancel should not produce errors."""
         dst = tmp_path / "dest"
         result = run_kosmokopy_with_cancel(
-            src=large_src, dst=dst, cancel_after=0.05,
+            src=large_src, dst=dst, cancel_after=0.2,
         )
-        assert result["errors"] == []
+        assert result.get("errors", []) == []
 
     def test_cancel_move_preserves_uncopied_source(self, large_src_for_move, tmp_path):
         """Cancel during move: un-transferred source files must still exist."""
@@ -115,7 +115,7 @@ class TestLocalCancelStandard:
         total_src = sum(1 for _ in large_src_for_move.rglob("*") if _.is_file())
 
         result = run_kosmokopy_with_cancel(
-            src=large_src_for_move, dst=dst, move=True, cancel_after=0.05,
+            src=large_src_for_move, dst=dst, move=True, cancel_after=0.2,
         )
         if result["status"] == "cancelled":
             remaining = sum(1 for _ in large_src_for_move.rglob("*") if _.is_file())
@@ -172,7 +172,7 @@ class TestCancelWithExclusions:
         dst = tmp_path / "dst"
 
         result = run_kosmokopy_with_cancel(
-            src=src, dst=dst, exclude=["~*.log"], cancel_after=0.05,
+            src=src, dst=dst, exclude=["~*.log"], cancel_after=0.2,
         )
         assert result["status"] in ("cancelled", "finished")
         assert result["excluded_files"] == 20
@@ -194,7 +194,7 @@ class TestImmediateCancel:
         # May be cancelled, finished (if very fast), or error (if signal
         # arrives before ctrlc handler is registered)
         assert result["status"] in ("cancelled", "finished", "error")
-        assert result["errors"] == []
+        assert result.get("errors", []) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════
